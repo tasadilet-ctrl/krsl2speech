@@ -44,6 +44,13 @@ def main():
     ap.add_argument('--n', type=int, default=4, help='clips to memorize')
     ap.add_argument('--steps', type=int, default=300)
     ap.add_argument('--lr', type=float, default=1e-4)
+    ap.add_argument('--encoder-lr', type=float, default=None,
+                    help='Separate LR for the encoder in section (C)/(E) '
+                         '(default: same as --lr). Test whether a much '
+                         'higher encoder LR than the real trainer\'s '
+                         'base_lr/10 default actually un-collapses the '
+                         'embeddings (see (E) below), before committing to '
+                         'a full slow training run.')
     ap.add_argument('--seed', type=int, default=42,
                     help='Fixed seed so section (C) is reproducible across '
                          'runs -- (A)/(B)/(B2) run under eval()+no_grad() '
@@ -221,9 +228,20 @@ def main():
               f"entirely, regardless of what the encoder produces)")
 
     # ---- (C) Fixed-LR memorization ----
-    print(f"\n--- (C) memorize {B} clips, {args.steps} steps @ lr={args.lr} ---")
+    # Differential LR (encoder vs. rest) so --encoder-lr can test whether
+    # base_lr/10 (the real trainer's default) is too conservative for what
+    # the encoder needs to learn, without waiting on a full training run.
+    enc_lr = args.encoder_lr if args.encoder_lr is not None else args.lr
+    print(f"\n--- (C) memorize {B} clips, {args.steps} steps @ "
+          f"lr={args.lr} (encoder_lr={enc_lr}) ---")
     model.train()
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    encoder_params = list(model.encoder.parameters())
+    encoder_param_ids = {id(p) for p in encoder_params}
+    other_params = [p for p in model.parameters() if id(p) not in encoder_param_ids]
+    opt = torch.optim.AdamW([
+        {'params': encoder_params, 'lr': enc_lr},
+        {'params': other_params, 'lr': args.lr},
+    ])
     for step in range(args.steps):
         loss, _, _ = model(kps, label_ids, label_attn, input_lengths=lengths)
         opt.zero_grad(); loss.backward()
@@ -246,6 +264,24 @@ def main():
         print(f"HYP: {hyps[b][:70]}\n")
     print("VERDICT: CE < 0.5 and HYP≈REF → pipeline sound (scale/schedule "
           "issue). CE stuck > 2 → structural bug; send this full output back.")
+
+    # ---- (E) Re-check embedding collapse AFTER memorization ----
+    # Directly tests whether this encoder_lr let the embeddings actually
+    # become more distinguishable across clips, vs. section (C)'s CE/HYP
+    # check alone (which can crash to ~0 via decoder-side memorization of a
+    # handful of sentences without the encoder discriminating anything --
+    # see (D)'s cross-attention finding).
+    print(f"\n--- (E) embedding collapse after memorization (encoder_lr={enc_lr}) ---")
+    model.eval()
+    with torch.no_grad():
+        emb_post = model.encoder(kps, input_lengths=lengths)
+    m3 = torch.nn.functional.normalize(
+        torch.stack([emb_post[b, :lengths[b]].mean(0) for b in range(B)]), dim=-1)
+    post_offdiag = (m3 @ m3.T - torch.eye(B, device=device)).max().item()
+    print(f"pairwise clip cosine after memorization: max offdiag={post_offdiag:.4f} "
+          f"(was {(cos - torch.eye(B, device=device)).max().item():.4f} before "
+          f"-- a real drop means this encoder_lr helps the encoder actually "
+          f"discriminate; unchanged means raising it alone isn't the fix)")
 
 
 if __name__ == '__main__':

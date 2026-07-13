@@ -395,7 +395,7 @@ class MT5Trainer:
                  freeze_spatial=False, use_lora=False, lora_r=16, lora_alpha=32,
                  use_enriched=False, masked_pose_ratio=0.0, overfit_n=0,
                  ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
-                 grad_accum=None):
+                 grad_accum=None, encoder_lr=None):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
         from utils.paths import apply_env_overrides
@@ -506,7 +506,16 @@ class MT5Trainer:
 
         # Optimizer — differential LR
         base_lr = self.train_cfg.get('learning_rate', 5e-4)
-        encoder_lr = base_lr / 10  # 5e-5 — gentle adaptation
+        # Default: base_lr/10, on the theory that the CSL-pretrained encoder
+        # only needs gentle adaptation. diagnose_phase1.py's (B)/(B3)/(D)
+        # checks found the encoder still produces near-collapsed embeddings
+        # across genuinely different clips (cosine ~0.98-0.995) even after
+        # 13 real epochs at this rate, while the decoder DOES attend to the
+        # pose frames substantially and still can't discriminate them --
+        # i.e. base_lr/10 may be too conservative for what the encoder
+        # actually needs to learn (KRSL-specific discrimination, not just
+        # light CSL adaptation). --encoder-lr overrides this directly.
+        encoder_lr = encoder_lr if encoder_lr is not None else base_lr / 10
 
         if freeze_spatial:
             self.encoder.freeze_spatial()
@@ -1154,6 +1163,17 @@ def main():
                              "len(train_loader) is tiny, so the config's "
                              "grad_accum=4 can collapse to ~1 optimizer step "
                              "per epoch. Pass --grad-accum 1 for sanity checks.")
+    parser.add_argument('--encoder-lr', type=float, default=None,
+                        help='Override the encoder LR (default: base_lr/10, '
+                             "a 'gentle adaptation' choice for the "
+                             'CSL-pretrained encoder). diagnose_phase1.py '
+                             'found the encoder still produces near-'
+                             'collapsed embeddings across genuinely '
+                             'different clips even after real training at '
+                             'that rate -- try something close to or equal '
+                             'to the base LR to test whether base_lr/10 is '
+                             'too conservative for what the encoder needs '
+                             'to learn.')
     parser.add_argument('--ctc-weight', type=float, default=0.0,
                         help='Weight of the subword-CTC auxiliary loss on '
                              'encoder frames (0.3 is a good start); forces '
@@ -1216,6 +1236,7 @@ def main():
         ctc_vocab_size=args.ctc_vocab_size,
         resume=args.resume,
         grad_accum=args.grad_accum,
+        encoder_lr=args.encoder_lr,
     )
 
     trainer.train(num_epochs=args.epochs, save_dir=args.save_dir)
