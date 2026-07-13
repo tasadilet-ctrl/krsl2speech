@@ -56,6 +56,14 @@ def main():
                          'runs -- (A)/(B)/(B2) run under eval()+no_grad() '
                          'and are already deterministic, but mT5 has active '
                          'dropout during the (C) training loop.')
+    ap.add_argument('--freeze-spatial', action='store_true',
+                    help='Freeze the CSL-pretrained spatial (hand-shape) '
+                         'STGCN blocks in section (C)/(E); only the '
+                         'temporal blocks + pose_proj + part_para stay '
+                         'trainable, at --encoder-lr. Tests whether '
+                         'KRSL-specific movement/timing can adapt without '
+                         'the spatial features drifting away from '
+                         'whatever hand-shape encoding they already have.')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -265,13 +273,26 @@ def main():
     # Differential LR (encoder vs. rest) so --encoder-lr can test whether
     # base_lr/10 (the real trainer's default) is too conservative for what
     # the encoder needs to learn, without waiting on a full training run.
+    # --freeze-spatial additionally freezes the CSL-pretrained spatial
+    # (hand-shape) blocks, leaving only the temporal blocks + pose_proj +
+    # part_para trainable at --encoder-lr -- tests whether KRSL-specific
+    # movement/timing can adapt without the spatial features drifting.
+    if args.freeze_spatial:
+        model.encoder.freeze_spatial()
     enc_lr = args.encoder_lr if args.encoder_lr is not None else args.lr
     print(f"\n--- (C) memorize {B} clips, {args.steps} steps @ "
-          f"lr={args.lr} (encoder_lr={enc_lr}) ---")
+          f"lr={args.lr} (encoder_lr={enc_lr}, "
+          f"freeze_spatial={args.freeze_spatial}) ---")
     model.train()
-    encoder_params = list(model.encoder.parameters())
-    encoder_param_ids = {id(p) for p in encoder_params}
-    other_params = [p for p in model.parameters() if id(p) not in encoder_param_ids]
+    # Exclude ALL encoder params (frozen or not) from other_params -- if
+    # --freeze-spatial is set, encoder_params below is only the trainable
+    # subset, but frozen spatial params still belong conceptually to the
+    # encoder and shouldn't leak into the "rest of the model" group (they
+    # get no gradient either way, so this only affects log clarity, not
+    # correctness).
+    all_encoder_param_ids = {id(p) for p in model.encoder.parameters()}
+    encoder_params = [p for p in model.encoder.parameters() if p.requires_grad]
+    other_params = [p for p in model.parameters() if id(p) not in all_encoder_param_ids]
     opt = torch.optim.AdamW([
         {'params': encoder_params, 'lr': enc_lr},
         {'params': other_params, 'lr': args.lr},
