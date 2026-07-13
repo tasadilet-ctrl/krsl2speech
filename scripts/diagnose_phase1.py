@@ -113,6 +113,49 @@ def main():
           f"{(cos - torch.eye(B, device=device)).max().item():.4f} "
           f"(≈1.0 → embeddings identical across clips → ENCODER BUG)")
 
+    # ---- (B2) ablation: does the additive part_para / pose_proj bias
+    #      dominate the final embedding, drowning out the per-clip signal
+    #      from the actual pose features? Both are added IDENTICALLY to
+    #      every sample and frame, right before the final projection. ----
+    print("\n--- (B2) part_para / pose_proj bias ablation ---")
+    captured = {}
+    def _capture_pre_proj(module, mod_args):
+        captured['pre_proj'] = mod_args[0].detach().clone()  # (B, T, 1024)
+    hook = model.encoder.pose_proj.register_forward_pre_hook(_capture_pre_proj)
+    with torch.no_grad():
+        _ = model.encoder(kps)
+    hook.remove()
+    pre_proj = captured['pre_proj']
+
+    part_para_norm = model.encoder.part_para.norm().item()
+    per_clip_mean = torch.stack([pre_proj[b, :lengths[b]].mean(0) for b in range(B)])
+    signal_spread = (per_clip_mean - per_clip_mean.mean(0, keepdim=True)).norm(dim=-1).mean().item()
+    print(f"part_para norm: {part_para_norm:.4f}  |  typical per-clip signal "
+          f"spread pre-pose_proj: {signal_spread:.4f} "
+          f"(part_para >> spread → the additive offset swamps the per-clip signal)")
+
+    saved_part_para = model.encoder.part_para.data.clone()
+    saved_bias = (model.encoder.pose_proj.bias.data.clone()
+                  if model.encoder.pose_proj.bias is not None else None)
+    model.encoder.part_para.data.zero_()
+    if saved_bias is not None:
+        model.encoder.pose_proj.bias.data.zero_()
+    with torch.no_grad():
+        emb_ablated = model.encoder(kps)
+    model.encoder.part_para.data.copy_(saved_part_para)
+    if saved_bias is not None:
+        model.encoder.pose_proj.bias.data.copy_(saved_bias)
+
+    m2 = torch.nn.functional.normalize(
+        torch.stack([emb_ablated[b, :lengths[b]].mean(0) for b in range(B)]), dim=-1)
+    cos2 = m2 @ m2.T
+    before = (cos - torch.eye(B, device=device)).max().item()
+    after = (cos2 - torch.eye(B, device=device)).max().item()
+    print(f"pairwise clip cosine WITHOUT part_para/bias: max offdiag={after:.4f} "
+          f"(was {before:.4f} with them) — a big drop confirms these additive "
+          f"terms were swamping the signal; still ≈1.0 here → the collapse "
+          f"happens earlier (GCN/BatchNorm layers), not at this final step")
+
     # ---- (C) Fixed-LR memorization ----
     print(f"\n--- (C) memorize {B} clips, {args.steps} steps @ lr={args.lr} ---")
     model.train()
