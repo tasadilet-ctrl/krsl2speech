@@ -394,7 +394,8 @@ class MT5Trainer:
                  pretrained_encoder=None, pretrained_unisign=None,
                  freeze_spatial=False, use_lora=False, lora_r=16, lora_alpha=32,
                  use_enriched=False, masked_pose_ratio=0.0, overfit_n=0,
-                 ctc_weight=0.0, ctc_vocab_size=2000, resume=None):
+                 ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
+                 grad_accum=None):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
         from utils.paths import apply_env_overrides
@@ -534,7 +535,16 @@ class MT5Trainer:
         self.optimizer = AdamW(param_groups, weight_decay=0.01)
 
         self.warmup_steps = self.train_cfg.get('warmup_steps', 1500)
-        self.grad_accum = max(1, int(self.train_cfg.get('grad_accum', 1)))
+        # config.yaml's grad_accum (4) is sized for the full asan-dataset
+        # run. With --overfit-n on a handful of clips, len(train_loader) is
+        # tiny (e.g. 4 batches for 30 clips at batch_size=8), so grad_accum=4
+        # collapses to ~1 optimizer step per epoch — nowhere near enough
+        # updates to memorize anything, regardless of loss weighting. This
+        # override lets sanity checks and other ad-hoc runs set their own
+        # value without editing the shared config.
+        effective_grad_accum = grad_accum if grad_accum is not None \
+            else self.train_cfg.get('grad_accum', 1)
+        self.grad_accum = max(1, int(effective_grad_accum))
         self.global_step = 0
         self.start_epoch = 0
         self.scheduler = None
@@ -1138,6 +1148,12 @@ def main():
     parser.add_argument('--overfit-n', type=int, default=0,
                         help='Sanity mode: train and validate on the first N '
                              'clips (expect near-0 CE if the pipeline is sound)')
+    parser.add_argument('--grad-accum', type=int, default=None,
+                        help="Override config.yaml's training.phase1.grad_accum. "
+                             "Needed for --overfit-n: with few clips, "
+                             "len(train_loader) is tiny, so the config's "
+                             "grad_accum=4 can collapse to ~1 optimizer step "
+                             "per epoch. Pass --grad-accum 1 for sanity checks.")
     parser.add_argument('--ctc-weight', type=float, default=0.0,
                         help='Weight of the subword-CTC auxiliary loss on '
                              'encoder frames (0.3 is a good start); forces '
@@ -1199,6 +1215,7 @@ def main():
         ctc_weight=args.ctc_weight,
         ctc_vocab_size=args.ctc_vocab_size,
         resume=args.resume,
+        grad_accum=args.grad_accum,
     )
 
     trainer.train(num_epochs=args.epochs, save_dir=args.save_dir)
