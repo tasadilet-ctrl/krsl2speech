@@ -227,6 +227,40 @@ def main():
               f"pose={pose_mass:.3f} (pose≈0 → decoder ignores the video "
               f"entirely, regardless of what the encoder produces)")
 
+    # ---- (F) BatchNorm running-stats reset ablation ----
+    # Every GCN_unit's nn.BatchNorm2d tracks running_mean/running_var via a
+    # slow momentum update (default 0.1 -> ~90% weight on OLD stats per
+    # batch). These were calibrated on CSL data during Uni-Sign pretraining;
+    # 13 real KRSL epochs may not have been enough to shift them much. This
+    # hard-resets them to the untrained default (mean=0, var=1) -- NO
+    # gradient steps, a single forward pass -- to test whether stale BN
+    # calibration alone is contributing to the collapse, independent of
+    # weight training.
+    print("\n--- (F) BatchNorm running-stats reset ablation ---")
+    bn_modules = [m for m in model.encoder.modules()
+                  if isinstance(m, torch.nn.BatchNorm2d)]
+    saved_bn_state = [(m.running_mean.clone(), m.running_var.clone(),
+                       m.num_batches_tracked.clone()) for m in bn_modules]
+    for m in bn_modules:
+        m.running_mean.zero_()
+        m.running_var.fill_(1.0)
+        m.num_batches_tracked.zero_()
+    model.eval()
+    with torch.no_grad():
+        emb_bn_reset = model.encoder(kps, input_lengths=lengths)
+    for m, (rm, rv, nb) in zip(bn_modules, saved_bn_state):
+        m.running_mean.copy_(rm)
+        m.running_var.copy_(rv)
+        m.num_batches_tracked.copy_(nb)
+    m4 = torch.nn.functional.normalize(
+        torch.stack([emb_bn_reset[b, :lengths[b]].mean(0) for b in range(B)]), dim=-1)
+    bn_offdiag = (m4 @ m4.T - torch.eye(B, device=device)).max().item()
+    print(f"{len(bn_modules)} BatchNorm2d modules reset | pairwise clip "
+          f"cosine: max offdiag={bn_offdiag:.4f} "
+          f"(was {(cos - torch.eye(B, device=device)).max().item():.4f} with "
+          f"the loaded running stats -- a real drop implicates stale BN "
+          f"calibration; unchanged rules it out too)")
+
     # ---- (C) Fixed-LR memorization ----
     # Differential LR (encoder vs. rest) so --encoder-lr can test whether
     # base_lr/10 (the real trainer's default) is too conservative for what
