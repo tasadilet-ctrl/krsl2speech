@@ -297,7 +297,9 @@ class UniSignMT5(nn.Module):
         # gradient signal to encode temporal context (the previous version
         # reconstructed from clean, no-grad embeddings, so the aux loss only
         # ever trained the small MLP head).
-        pose_emb = self.pose_norm(self.encoder(kps))  # (B, T, 768)
+        # input_lengths re-zeroes pad frames before the encoder's temporal
+        # conv so batch padding can't bleed into real boundary frames.
+        pose_emb = self.pose_norm(self.encoder(kps, input_lengths=input_lengths))  # (B, T, 768)
 
         # Prefix embeds: re-embed each forward for grad correctness
         # (~10 token lookup is free, avoids backward-through-cached-graph bugs)
@@ -357,7 +359,7 @@ class UniSignMT5(nn.Module):
         """
         B = kps.size(0)
 
-        pose_emb = self.pose_norm(self.encoder(kps))  # (B, T, 768)
+        pose_emb = self.pose_norm(self.encoder(kps, input_lengths=input_lengths))  # (B, T, 768)
 
         prefix_embeds = self.mt5.shared(self.prefix_ids.unsqueeze(0).expand(B, -1))
         prefix_attn = self.prefix_attn.unsqueeze(0).expand(B, -1)

@@ -166,7 +166,8 @@ class SignToSpeechPipeline:
         # 2. Prosody (Phase 2)
         prosody = None
         if self.prosody_gan is not None:
-            pose_emb = self.model.pose_norm(self.model.encoder(kps_t))  # (1, T, 768)
+            pose_emb = self.model.pose_norm(
+                self.model.encoder(kps_t, input_lengths=lengths))  # (1, T, 768)
             prosody, _ = self.prosody_gan.generator(pose_emb, lengths)  # (1, T, 2)
 
         # 3. Mel (Phase 3)

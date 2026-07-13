@@ -260,9 +260,12 @@ class ProsodyTrainer:
             # not something the generator should reproduce.
             kps_target = kps[:, :, :KEYPOINT_DIM]
 
-            # Forward through frozen encoder (+ Phase-1 output norm)
+            # Forward through frozen encoder (+ Phase-1 output norm).
+            # input_lengths re-zeroes pad frames before the encoder's
+            # temporal conv so batch padding can't bleed into real frames.
             with torch.no_grad():
-                encoder_out = self.pose_norm(self.encoder(kps))  # (B, T, d_model)
+                encoder_out = self.pose_norm(
+                    self.encoder(kps, input_lengths=input_lens))  # (B, T, d_model)
 
             # ---- Discriminator step (forward through DDP wrapper if any) ----
             self.optimizer_d.zero_grad()
@@ -331,7 +334,8 @@ class ProsodyTrainer:
             kps_target = kps[:, :, :KEYPOINT_DIM]
 
             # Forward through frozen encoder (+ Phase-1 output norm)
-            encoder_out = self.pose_norm(self.encoder(kps))  # (B, T, d_model)
+            encoder_out = self.pose_norm(
+                self.encoder(kps, input_lengths=input_lens))  # (B, T, d_model)
 
             # Generate prosody
             prosody_gen, recon_kp = self.core.generator(encoder_out, input_lens)

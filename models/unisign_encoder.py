@@ -678,7 +678,7 @@ class KeypointEncoder(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, kps_raw, scores=None, freeze_spatial=False):
+    def forward(self, kps_raw, scores=None, freeze_spatial=False, input_lengths=None):
         """
         Forward pass matching Uni-Sign's pose branch.
 
@@ -688,11 +688,31 @@ class KeypointEncoder(nn.Module):
                      D=1128: enriched (offset + velocity + acc + validity)
             scores: (B, T, 133) — detection confidence (optional, unused)
             freeze_spatial: deprecated, use encoder.freeze_spatial() instead
+            input_lengths: (B,) — true (unpadded) frame count per sample.
+                Batches are zero-padded to the longest clip, but Conv2d bias
+                and BatchNorm2d affine shift turn those zero frames into a
+                nonzero, batch-dependent constant after the first spatial
+                block. The temporal STGCN (kernel_size=5) then convolves
+                that constant into the last two REAL frames of every
+                shorter-than-max clip. Re-zeroing at pad positions before
+                the time-mixing step keeps the boundary artifact-free; if
+                omitted, forward runs exactly as before (no masking).
 
         Returns:
             pose_emb: (B, T, 768)
         """
         B, T, _ = kps_raw.shape
+
+        pad_mask = None  # (B, 1, T, 1), True at padded (invalid) positions
+        if input_lengths is not None:
+            valid = (torch.arange(T, device=kps_raw.device)[None, :]
+                     < input_lengths.to(kps_raw.device)[:, None])  # (B, T)
+            pad_mask = (~valid)[:, None, :, None]
+
+        def zero_pad(x):
+            if pad_mask is None:
+                return x
+            return x.masked_fill(pad_mask, 0.0)
 
         # Map to Uni-Sign format
         parts = map_keypoints_to_unisign_format(kps_raw)
@@ -707,9 +727,13 @@ class KeypointEncoder(nn.Module):
 
             # Rearrange to (B, C, T, V) for Conv2d
             proj_feat = proj_feat.permute(0, 3, 1, 2)  # (B, 64, T, V)
+            proj_feat = zero_pad(proj_feat)  # cancel proj_linear's bias at pad frames
 
-            # Spatial STGCN: [[64,1], [128,1], [256,1]]
+            # Spatial STGCN: [[64,1], [128,1], [256,1]]. No temporal kernel
+            # here (t_kernel_size=1), so this only mixes across graph nodes —
+            # padded frames stay independent of real ones through this stage.
             gcn_feat = self.gcn_modules[part](proj_feat)
+            gcn_feat = zero_pad(gcn_feat)  # cancel 3 chained BN/bias shifts
 
             # Body feature fusion (matches Uni-Sign)
             # body_feat is (B, 256, T, 9). gcn_feat is (B, 256, T, V_group).
@@ -731,9 +755,15 @@ class KeypointEncoder(nn.Module):
                         # Add detached neck (body node 0)
                         feat_add = body_feat[:, :, :, 0].detach().unsqueeze(-1)  # (B, 256, T, 1)
                         gcn_feat = gcn_feat + feat_add.expand_as(gcn_feat)
+                    gcn_feat = zero_pad(gcn_feat)  # body_feat is already clean, but re-assert
 
-            # Temporal STGCN: [[256,3]]
+            # Temporal STGCN: [[256,3]], kernel_size=5 — this is the one block
+            # that actually mixes neighbouring TIME steps, so its input must
+            # be true zero at pad positions (guaranteed by zero_pad above)
+            # or the conv blends a learned pad-artifact into the last ~2
+            # real frames of every clip shorter than the batch max.
             gcn_feat = self.fusion_gcn_modules[part](gcn_feat)  # (B, 256, T, V)
+            gcn_feat = zero_pad(gcn_feat)  # keep pad frames clean for downstream consumers
 
             # Mean pool over nodes
             pool_feat = gcn_feat.mean(dim=3)  # (B, 256, T)
@@ -744,6 +774,8 @@ class KeypointEncoder(nn.Module):
         inputs = torch.cat(features, dim=-1)  # (B, T, 1024)
         inputs = inputs + self.part_para  # trainable offset
         inputs = self.pose_proj(inputs)  # (B, T, 768)
+        if pad_mask is not None:
+            inputs = inputs.masked_fill(pad_mask.squeeze(1), 0.0)
 
         return inputs
 
