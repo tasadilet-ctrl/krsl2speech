@@ -394,7 +394,7 @@ class MT5Trainer:
                  pretrained_encoder=None, pretrained_unisign=None,
                  freeze_spatial=False, use_lora=False, lora_r=16, lora_alpha=32,
                  use_enriched=False, masked_pose_ratio=0.0, overfit_n=0,
-                 ctc_weight=0.0, ctc_vocab_size=2000):
+                 ctc_weight=0.0, ctc_vocab_size=2000, resume=None):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
         from utils.paths import apply_env_overrides
@@ -408,6 +408,16 @@ class MT5Trainer:
         self.masked_pose_ratio = masked_pose_ratio
         self.overfit_n = overfit_n
         self.ctc_weight = ctc_weight
+        self.freeze_spatial = freeze_spatial
+        # Flags that determine model/optimizer structure — saved into the
+        # checkpoint so --resume can verify the resuming run uses the same
+        # architecture (a mismatch here breaks state_dict loads far less
+        # clearly than this explicit check does).
+        self._run_args = dict(
+            use_enriched=use_enriched, masked_pose_ratio=masked_pose_ratio,
+            ctc_weight=ctc_weight, ctc_vocab_size=ctc_vocab_size,
+            freeze_spatial=freeze_spatial, use_lora=use_lora,
+        )
 
         # Subword-BPE vocabulary for the CTC auxiliary loss (id 0 = blank).
         # Character-level CTC is unusable here: sign clips are ~223 frames vs
@@ -526,6 +536,7 @@ class MT5Trainer:
         self.warmup_steps = self.train_cfg.get('warmup_steps', 1500)
         self.grad_accum = max(1, int(self.train_cfg.get('grad_accum', 1)))
         self.global_step = 0
+        self.start_epoch = 0
         self.scheduler = None
         self.encoder_total_params = sum(p.numel() for p in self.encoder.parameters())
         core = self.model.module if self.distributed else self.model
@@ -549,8 +560,95 @@ class MT5Trainer:
         self.max_epochs = self.train_cfg.get('max_epochs', 20)
         self.best_loss = float('inf')
 
+        # --- Resume: full trainer state (model + optimizer + step count) ---
+        # Unlike --pretrained-encoder (which loads ONLY the encoder submodule
+        # and is meant for starting a NEW phase/run), --resume restores the
+        # exact state of an interrupted or completed run so training can
+        # continue past it — including the fine-tuned MT5/LoRA weights and
+        # the CTC/masked-pose heads that --pretrained-encoder silently drops.
+        # Placed after best_loss/max_epochs are set above so resume can
+        # override best_loss with the checkpoint's actual value.
+        if resume:
+            self._load_resume_checkpoint(resume)
+
         log(f"\n[MT5 Trainer] Encoder: {self.encoder_total_params:,} | MT5: {self.mt5_params:,}")
         log(f"[MT5 Trainer] Device: {self.device}")
+
+    def _load_resume_checkpoint(self, path):
+        """
+        Restore a full trainer state saved by _build_checkpoint: model
+        weights (encoder, pose_norm, mT5/LoRA, CTC head, masked-pose
+        decoder), optimizer state, and step/epoch counters — so training
+        continues exactly where it left off instead of quietly restarting
+        the decoder from its pretrained-HuggingFace state, which is what
+        --pretrained-encoder does (it only ever touches the encoder).
+        """
+        log(f"[Resume] Loading trainer state from {path}")
+        ckpt = torch.load(path, map_location='cpu')
+
+        saved_args = ckpt.get('run_args', {})
+        mismatches = {
+            k: (self._run_args[k], saved_args[k]) for k in saved_args
+            if k in self._run_args and self._run_args[k] != saved_args[k]
+        }
+        if mismatches:
+            raise ValueError(
+                f"[Resume] Architecture flags differ from the checkpoint's "
+                f"run (current, saved): {mismatches}. Resume must use the "
+                f"same flags the checkpoint was trained with — a mismatch "
+                f"here means the model/optimizer structure won't line up.")
+
+        core = self.model.module if self.distributed else self.model
+        core.encoder.load_state_dict(ckpt['encoder'])
+        core.pose_norm.load_state_dict(ckpt['pose_norm'])
+
+        if self.use_lora:
+            if 'mt5_lora' not in ckpt:
+                raise ValueError("[Resume] --use-lora is set but the "
+                                 "checkpoint has no 'mt5_lora' weights.")
+            core.mt5.load_state_dict(ckpt['mt5_lora'], strict=False)
+        else:
+            if 'mt5' not in ckpt:
+                raise ValueError("[Resume] checkpoint has no full 'mt5' "
+                                 "weights (was it saved with --use-lora?).")
+            core.mt5.load_state_dict(ckpt['mt5'])
+
+        if core.ctc_head is not None:
+            if 'ctc_head' not in ckpt:
+                raise ValueError("[Resume] --ctc-weight > 0 but the "
+                                 "checkpoint has no CTC head.")
+            core.ctc_head.load_state_dict(ckpt['ctc_head'])
+
+        if core.masked_pose_decoder is not None:
+            if 'masked_pose_decoder' not in ckpt:
+                raise ValueError("[Resume] --masked-pose-ratio > 0 but the "
+                                 "checkpoint has no masked-pose decoder.")
+            core.masked_pose_decoder.load_state_dict(ckpt['masked_pose_decoder'])
+
+        if 'optimizer' in ckpt:
+            self.optimizer.load_state_dict(ckpt['optimizer'])
+            self.global_step = ckpt.get('global_step', 0)
+        else:
+            # No optimizer state to restore momentum/variance from, and
+            # crucially no 'initial_lr' seeded into param_groups (only a
+            # scheduler construction or a loaded optimizer state_dict sets
+            # that) — train() would hit a hard KeyError if it then tried to
+            # fast-forward a scheduler via last_epoch=global_step-1 on a
+            # fresh, scheduler-naive optimizer. Force global_step to 0 so
+            # train() takes its normal last_epoch=-1 path instead: a "soft"
+            # resume that restarts the LR schedule from warmup but still
+            # skips the epochs already completed.
+            log("[Resume] WARNING: checkpoint has no optimizer state (saved "
+                "by an older run) — Adam momentum/variance restart at zero, "
+                "and the LR schedule restarts from warmup instead of "
+                "continuing mid-decay (the epoch counter still resumes "
+                "correctly).")
+            self.global_step = 0
+        self.start_epoch = ckpt.get('epoch', -1) + 1
+        self.best_loss = ckpt.get('val_loss', float('inf'))
+        log(f"[Resume] checkpoint was at epoch {ckpt.get('epoch')} -> "
+            f"continuing from epoch {self.start_epoch + 1}, "
+            f"global_step={self.global_step}, best_loss={self.best_loss:.4f}")
 
     @staticmethod
     def _build_bpe_tokenizer(paths, vocab_size=2000):
@@ -916,6 +1014,13 @@ class MT5Trainer:
             'pose_norm': core.pose_norm.state_dict(),
             'epoch': epoch, 'val_loss': val_loss, 'wer': wer,
             'use_lora': self.use_lora,
+            # Full trainer state for --resume: optimizer state (Adam
+            # momentum/variance) and the optimizer-step counter the LR
+            # scheduler needs to continue its cosine curve mid-decay
+            # instead of restarting from warmup.
+            'optimizer': self.optimizer.state_dict(),
+            'global_step': self.global_step,
+            'run_args': self._run_args,
         }
         if core.ctc_head is not None:
             ckpt['ctc_head'] = core.ctc_head.state_dict()
@@ -952,17 +1057,27 @@ class MT5Trainer:
         if warmup_eff < self.warmup_steps:
             log(f"[Scheduler] warmup capped: {self.warmup_steps} → {warmup_eff} "
                 f"(10% of {total_steps} total steps)")
+        # When resuming, num_epochs is the NEW total (e.g. 30 after an
+        # original 25-epoch run) — the cosine curve is recomputed to span
+        # that full total, then last_epoch fast-forwards it to global_step
+        # so the LR continues mid-decay instead of restarting from warmup.
+        # (This does mean extending the total changes the shape of the
+        # decay — expected when you decide to train longer than planned.)
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer, num_warmup_steps=warmup_eff,
             num_training_steps=total_steps,
+            last_epoch=self.global_step - 1 if self.global_step > 0 else -1,
         )
 
         log(f"\n{'='*60}")
         log(f"Phase 1: Uni-Sign Encoder + MT5")
-        log(f"Epochs: {num_epochs}")
+        if self.start_epoch > 0:
+            log(f"Resuming at epoch {self.start_epoch + 1}, "
+                f"global_step={self.global_step}")
+        log(f"Epochs: {num_epochs} (total, including any already completed)")
         log(f"{'='*60}\n")
 
-        for epoch in range(num_epochs):
+        for epoch in range(self.start_epoch, num_epochs):
             epoch_start = time.time()
 
             if self.distributed and hasattr(train_loader.sampler, 'set_epoch'):
@@ -1033,10 +1148,26 @@ def main():
                              'Larger = longer pieces = shorter targets (helps '
                              'the frames>=targets constraint), but a bigger '
                              'CTC head. 2000 gives ~2.5 chars/piece.')
-    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Total epoch count for this run. With --resume, '
+                             'this is the NEW total (e.g. 30 to add 5 epochs '
+                             'to a completed 25-epoch run), not an increment.')
     parser.add_argument('--save-dir', default=None)
     parser.add_argument('--local_rank', type=int, default=-1)
+    parser.add_argument('--resume', default=None,
+                        help='Path to a phase1_mt5_*.pth checkpoint to fully '
+                             'resume from (model + optimizer + step count), '
+                             'e.g. to train more epochs than originally '
+                             'planned. Must be run with the SAME '
+                             '--use-enriched/--masked-pose-ratio/--ctc-weight/'
+                             '--ctc-vocab-size/--freeze-spatial/--use-lora '
+                             'flags the checkpoint was trained with. Overrides '
+                             '--pretrained-encoder/--pretrained-unisign.')
     args = parser.parse_args()
+
+    if args.resume and (args.pretrained_encoder or args.pretrained_unisign):
+        print("[WARN] --resume overrides --pretrained-encoder/--pretrained-unisign "
+              "(their weights would be loaded then immediately replaced).")
 
     # Generous NCCL timeout: rank 0 does beam-search WER at validation while
     # other ranks wait; the 10-minute default watchdog is too tight.
@@ -1067,6 +1198,7 @@ def main():
         overfit_n=args.overfit_n,
         ctc_weight=args.ctc_weight,
         ctc_vocab_size=args.ctc_vocab_size,
+        resume=args.resume,
     )
 
     trainer.train(num_epochs=args.epochs, save_dir=args.save_dir)
