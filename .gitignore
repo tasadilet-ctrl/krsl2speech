@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.DS_Store
+.Rhistory
+
+# training artifacts (live on HPC boxes, not synced back)
+output/
+checkpoints/
+*.pth
+*.pt
+ctc_bpe_*.model
+ctc_bpe_*_corpus.txt
+
+# large scratch/reference dumps
+Sign2Speech_Latest.txt

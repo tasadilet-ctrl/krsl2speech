@@ -1,0 +1,118 @@
+# ============================================================
+# KRSL → Kazakh Speech (S2PFormer-adapted)
+# ============================================================
+
+paths:
+  # Dataset roots — NEW HPC paths
+  data_root: "/raid/shared/alikhan_datasets"
+
+  khabar_kz:
+    manifest: "/raid/shared/alikhan_datasets/khabar_kz/khabar_kz.jsonl"
+    keypoints: "/raid/shared/alikhan_datasets/khabar_kz/keypoints"
+    clips: "/raid/shared/alikhan_datasets/khabar_kz/clips"
+
+  khabar_source:
+    keypoints: "/raid/shared/khabar/keypoints/kz"
+    audio: "/raid/shared/khabar/audio/kz"
+    transcripts: "/raid/shared/khabar/transcripts/kz"
+
+  kazsign:
+    root: "/raid/shared/kazsign-dataset"
+    keypoints: "/raid/shared/kazsign-keypoints"  # after extract.py
+
+  informburo:
+    keypoints: "/raid/shared/informburo/keypoints/kz"
+    audio: "/raid/shared/informburo/audio/kz"
+    transcripts: "/raid/shared/informburo/transcripts/kz"
+    clips_keypoints: "/raid/shared/informburo/keypoints_clips/kz"
+    clips_text: "/raid/shared/informburo/transcripts_clips/kz"
+
+  informburo_kz:
+    manifest: "/raid/shared/alikhan_datasets/informburo/informburo_kz.jsonl"
+    keypoints: "/raid/shared/alikhan_datasets/informburo/keypoints/kz"
+
+  # asan-dataset — 360+ h umbrella dataset with predefined train/dev/test
+  # splits (annotations/kz/{train,dev,test}.json). Per-clip pose .pkl files.
+  asan:
+    root: "/data/shared/asan-dataset"
+    sources: ["informburo", "khabar", "qazaqstantv"]
+    lang: "kz"
+    skip_low_quality: true
+    min_hand_cov: 0.0     # e.g. 0.5 to drop clips with poor hand detection
+    downsample_every: 2   # videos are 50 fps → 25 fps for the encoder
+    # Output root of scripts/extract_asan_prosody.py (per-clip wavs,
+    # prosody .npy, and manifest_{split}.jsonl for phases 2-3)
+    prosody_root: "/data/home/adilet_tasbolat/krsl2speech/data/asan_audio"
+
+  output: "/data/home/adilet_tasbolat/krsl2speech/output"
+
+  # Prosody extraction output
+  prosody:
+    khabar_kz: "/raid/shared/alikhan_datasets/khabar_kz/prosody"
+    informburo: "/raid/shared/informburo/prosody/kz"
+
+model:
+  # Keypoint input: body(11×2)+face(68×2)+lips(20×2)+hand_l(21×2)+hand_r(21×2) = 282
+  keypoint_dim: 282
+  d_model: 768        # Uni-Sign encoder hidden_dim; MT5-base d_model (must match)
+  dropout: 0.1
+
+  # --- Dead keys (kept only so old scripts don't KeyError). The current
+  #     Uni-Sign ST-GCN encoder has a FIXED 3-block spatial + 1-block temporal
+  #     architecture and ignores these. Remove once train_encoder.py / the old
+  #     CTR-GCN path are deleted. ---
+  nhead: 8              # UNUSED by unisign_encoder
+  num_encoder_layers: 6 # UNUSED by unisign_encoder
+  dim_feedforward: 2048 # UNUSED by unisign_encoder
+
+  # Vocabulary — only used by the legacy SentencePiece/CTC path. The MT5 path
+  # uses MT5's own tokenizer and ignores this.
+  vocab_size: 8000
+
+  # Prosody: Phase 2 GAN outputs [F0, energy] (duration comes from alignment,
+  # not the GAN), so the effective prosody_dim consumed downstream is 2.
+  prosody_dim: 2
+
+  # TTS
+  n_mel: 80
+
+training:
+  phase1:
+    # Encoder + MT5 (Cross-Entropy, differential LR)
+    # Single-GPU (96 GB) setup: batch 8 x grad_accum 4 = effective batch 32,
+    # same as the old 16 x 2-GPU config, so learning_rate/warmup carry over.
+    # (batch 16 fits with LoRA but OOMs with FULL MT5 fine-tuning — grads +
+    # Adam states for 582M params add ~9 GB.)
+    batch_size: 8
+    grad_accum: 4          # optimizer step every N batches
+    learning_rate: 5.0e-4  # MT5 base LR; encoder gets lr/10
+    weight_decay: 0.01
+    warmup_steps: 1500     # warmup + cosine decay
+    # asan-dataset is ~10x khabar: ~60k clips / 32 ≈ 1900 steps/epoch.
+    # 10 epochs ≈ 19k optimizer steps — comparable to the old 20-epoch run.
+    max_epochs: 10
+    max_seq_len: 1000   # max frames per clip (after downsampling)
+    max_text_len: 128   # max MT5 subword tokens (matches SimpleCollator)
+
+  phase2:
+    # Prosody GAN
+    batch_size: 8
+    lr_generator: 1.0e-4
+    lr_discriminator: 4.0e-4
+    lambda_adv: 0.1
+    lambda_recon: 1.0
+    lambda_prosody: 5.0
+    max_epochs: 100
+    max_seq_len: 1000
+
+  phase3:
+    # Standalone FastSpeech2 TTS (text + prosody -> mel).
+    batch_size: 16
+    learning_rate: 1.0e-4
+    warmup_steps: 1000
+    lambda_dur: 0.1      # weight on auxiliary duration-predictor loss
+    max_epochs: 100
+
+inference:
+  vocoder_path: null  # set to HiFi-GAN checkpoint path
+  device: "cuda"

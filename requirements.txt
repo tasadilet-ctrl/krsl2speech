@@ -1,0 +1,40 @@
+# KRSL → Kazakh Speech (S2PFormer-adapted)
+# Install with: pip install -r requirements.txt
+
+# Core
+torch>=2.0.0
+numpy>=1.24.0
+pyyaml>=6.0
+
+# Audio
+librosa>=0.10.0
+numba>=0.59.0         # required for librosa + python 3.12
+llvmlite>=0.43.0      # required for numba + python 3.12
+soundfile>=0.12.0
+pyworld>=0.3.0       # F0 extraction (more accurate than parselmouth)
+audioread>=3.0.0     # for .opus decoding
+
+# Tokenization
+sentencepiece>=0.2.0  # BPE tokenization for Kazakh text
+
+# Data loading
+opencv-python>=4.8.0
+tqdm>=4.66.0
+
+# Training
+torchmetrics>=1.3.0
+wandb>=0.16.0        # experiment tracking (optional)
+
+# Evaluation
+jiwer>=3.0.0         # WER/CER
+
+# TTS (Phase 3)
+# HiFi-GAN vocoder
+# git+https://github.com/jik876/hifi-gan.git
+
+# MViTv2 (optional, for transfer learning from Slovo)
+timm>=0.9.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.13.0
