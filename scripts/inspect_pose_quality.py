@@ -39,21 +39,39 @@ from data.utils import BODY_IDX, FACE_IDX
 
 
 def group_stats(sc_group, name, low_thresh):
-    """sc_group: (T, n_joints) raw detection scores for one keypoint group."""
+    """
+    sc_group: (T, n_joints) raw detection scores for one keypoint group.
+
+    The raw scale of these scores is NOT assumed to be a normalized [0,1]
+    confidence (asan-dataset's raw values turned out to run ~5-8, not
+    0-1 -- a fixed low_thresh=0.3 would trivially pass everything and miss
+    real dropouts). Prints the raw distribution (min/p5/median/p95/max) so
+    the actual scale is visible, and ALSO flags per-frame dips RELATIVE to
+    this clip's own median (scale-agnostic), alongside the fixed-threshold
+    check for reference.
+    """
     nan_frac = float(np.isnan(sc_group).mean())
     sc_clean = np.nan_to_num(sc_group, nan=0.0)
-    mean_conf = float(sc_clean.mean())
     frame_conf = sc_clean.mean(axis=-1)  # (T,) — per-frame group confidence
+
+    lo, p5, p50, p95, hi = np.percentile(frame_conf, [0, 5, 50, 95, 100])
     low_frac = float((frame_conf < low_thresh).mean())
 
+    # Relative dip: frames below 30% of this clip's own median -- catches
+    # dropouts regardless of what absolute scale the scores are on.
+    rel_thresh = 0.3 * p50 if p50 > 0 else low_thresh
+    rel_mask = frame_conf < rel_thresh
+    rel_frac = float(rel_mask.mean())
     longest_run, cur = 0, 0
-    for v in (frame_conf < low_thresh):
+    for v in rel_mask:
         cur = cur + 1 if v else 0
         longest_run = max(longest_run, cur)
 
-    print(f"    {name:10s}: mean_conf={mean_conf:.3f}  nan_frac={nan_frac:.3f}  "
-          f"low_conf(<{low_thresh})_frac={low_frac:.3f}  "
-          f"longest_low_run={longest_run} frames")
+    print(f"    {name:10s}: range=[{lo:.3f}, {p5:.3f}, {p50:.3f}, {p95:.3f}, "
+          f"{hi:.3f}] (min/p5/median/p95/max)  nan_frac={nan_frac:.3f}")
+    print(f"      fixed low_conf(<{low_thresh})_frac={low_frac:.3f}  |  "
+          f"relative dip(<30% of own median)_frac={rel_frac:.3f}  "
+          f"longest_run={longest_run} frames")
 
 
 def main():
