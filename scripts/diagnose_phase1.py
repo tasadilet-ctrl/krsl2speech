@@ -32,12 +32,28 @@ from train.train_encoder_mt5 import UniSignMT5, SimpleCollator
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default='configs/config.yaml')
-    ap.add_argument('--pretrained-unisign', default=None)
+    ap.add_argument('--pretrained-unisign', default=None,
+                    help='Raw Uni-Sign/CSL checkpoint (never seen KRSL data)')
+    ap.add_argument('--pretrained-encoder', default=None,
+                    help="Our fine-tuned encoder checkpoint (e.g. a "
+                         "phase1_mt5_*.pth from a real training run) -- lets "
+                         "you check whether actual KRSL fine-tuning has "
+                         "changed the (B) embedding-collapse cosine at all, "
+                         "vs. testing the cold CSL-pretrained-only encoder.")
     ap.add_argument('--use-enriched', action='store_true')
     ap.add_argument('--n', type=int, default=4, help='clips to memorize')
     ap.add_argument('--steps', type=int, default=300)
     ap.add_argument('--lr', type=float, default=1e-4)
+    ap.add_argument('--seed', type=int, default=42,
+                    help='Fixed seed so section (C) is reproducible across '
+                         'runs -- (A)/(B)/(B2) run under eval()+no_grad() '
+                         'and are already deterministic, but mT5 has active '
+                         'dropout during the (C) training loop.')
     args = ap.parse_args()
+
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     with open(args.config) as f:
@@ -52,6 +68,11 @@ def main():
                               input_dim=input_dim)
     if args.pretrained_unisign:
         load_unisign_weights(encoder, args.pretrained_unisign)
+    if args.pretrained_encoder:
+        print(f"\n[diagnose] Loading fine-tuned encoder from "
+              f"{args.pretrained_encoder}")
+        ckpt = torch.load(args.pretrained_encoder, map_location='cpu')
+        encoder.load_state_dict(ckpt['encoder'] if 'encoder' in ckpt else ckpt)
     model = UniSignMT5(encoder=encoder, lang="Kazakh").to(device)
 
     # ---- Data: first N usable clips ----
