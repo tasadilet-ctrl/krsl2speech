@@ -191,6 +191,35 @@ def main():
           f"terms were swamping the signal; still ≈1.0 here → the collapse "
           f"happens earlier (GCN/BatchNorm layers), not at this final step")
 
+    # ---- (D) Decoder cross-attention: mean-pooling over T (used by (B)/(B3)
+    #      above) is NOT what the real model does -- UniSignMT5.forward feeds
+    #      mT5 the FULL per-frame sequence and lets cross-attention pick out
+    #      whatever's relevant. A collapsed mean-pool doesn't prove per-frame
+    #      information is unusable; this checks what the decoder actually
+    #      does with it, on the untouched loaded checkpoint (run before (C)
+    #      mutates the weights via memorization). ----
+    print("\n--- (D) decoder cross-attention: prefix vs. pose frames ---")
+    model.eval()
+    with torch.no_grad():
+        pose_emb = model.pose_norm(model.encoder(kps, input_lengths=lengths))
+        prefix_embeds = model.mt5.shared(model.prefix_ids.unsqueeze(0).expand(B, -1))
+        prefix_attn = model.prefix_attn.unsqueeze(0).expand(B, -1)
+        pose_mask = model._pose_mask(kps, lengths)
+        inputs_embeds = torch.cat([prefix_embeds, pose_emb], dim=1)
+        attn_mask = torch.cat([prefix_attn, pose_mask], dim=1)
+        out = model.mt5(inputs_embeds=inputs_embeds, attention_mask=attn_mask,
+                        labels=label_ids, output_attentions=True, return_dict=True)
+    P = prefix_embeds.size(1)
+    last_layer_attn = out.cross_attentions[-1].mean(dim=1)  # avg over heads -> (B, dec_len, P+T)
+    for b in range(B):
+        valid_dec = int((label_ids[b] != -100).sum().item())
+        a = last_layer_attn[b, :valid_dec]  # (dec_len, P+T)
+        prefix_mass = a[:, :P].sum(-1).mean().item()
+        pose_mass = a[:, P:P + int(lengths[b])].sum(-1).mean().item()
+        print(f"clip {b}: attention mass on prefix={prefix_mass:.3f}  "
+              f"pose={pose_mass:.3f} (pose≈0 → decoder ignores the video "
+              f"entirely, regardless of what the encoder produces)")
+
     # ---- (C) Fixed-LR memorization ----
     print(f"\n--- (C) memorize {B} clips, {args.steps} steps @ lr={args.lr} ---")
     model.train()
