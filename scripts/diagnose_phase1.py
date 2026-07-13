@@ -42,6 +42,8 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+    from utils.paths import apply_env_overrides
+    cfg = apply_env_overrides(cfg)
     acfg = cfg['paths']['asan']
     input_dim = ENRICHED_DIM() if args.use_enriched else KEYPOINT_DIM
 
@@ -63,6 +65,12 @@ def main():
         s = ds[i]; i += 1
         if s['input_length'] > 1 and s['text'].strip():
             samples.append(s)
+    if not samples:
+        print(f"\n[diagnose] ERROR: 0 usable clips out of {len(ds)} in the "
+              f"dataset. Likely cause: 'paths.asan.root' in {args.config} "
+              f"({acfg['root']}) doesn't exist on this machine — check for "
+              f"'WARNING: missing ...' lines above, or set ASAN_ROOT.")
+        sys.exit(1)
     collator = SimpleCollator(mt5_tokenizer=model.mt5_tokenizer,
                               max_text_tokens=128)
     batch = collator(samples)
