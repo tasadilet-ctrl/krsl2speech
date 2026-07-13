@@ -46,7 +46,8 @@ from data.kazsign_dataset import KazSignDataset
 from data.informburo_dataset import InformburoDataset
 from data.asan_dataset import AsanDataset
 from data.utils import ENRICHED_DIM, KEYPOINT_DIM
-from models.unisign_encoder import KeypointEncoder, load_unisign_weights
+from models.unisign_encoder import (
+    KeypointEncoder, load_unisign_weights, build_masked_pose_decoder)
 
 
 # ============================================================
@@ -231,13 +232,8 @@ class UniSignMT5(nn.Module):
 
         self.masked_pose_decoder = None
         if masked_pose_dim is not None:
-            d_model = encoder.hidden_dim
-            self.masked_pose_decoder = nn.Sequential(
-                nn.Linear(d_model, 512),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(512, masked_pose_dim),
-            )
+            self.masked_pose_decoder = build_masked_pose_decoder(
+                encoder.hidden_dim, masked_pose_dim)
 
         # MT5
         self.mt5 = MT5ForConditionalGeneration.from_pretrained(mt5_path)

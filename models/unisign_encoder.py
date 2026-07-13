@@ -807,3 +807,21 @@ class KeypointEncoder(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         frozen = total - trainable
         return total, trainable, frozen
+
+
+def build_masked_pose_decoder(d_model, output_dim):
+    """
+    Reconstruction head for masked-pose self-supervision: predicts the
+    clean keypoint vector from a (possibly masked-input) encoder embedding.
+
+    Shared between UniSignMT5 (train/train_encoder_mt5.py, where it's a
+    small 0.1-weighted auxiliary loss during Phase 1) and
+    train/train_pose_pretrain.py (where it's the sole training objective,
+    for a dedicated pretraining phase run before Phase 1 ever touches mT5).
+    """
+    return nn.Sequential(
+        nn.Linear(d_model, 512),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(512, output_dim),
+    )

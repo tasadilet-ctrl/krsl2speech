@@ -92,6 +92,19 @@ training:
     # 10 epochs ≈ 19k optimizer steps — comparable to the old 20-epoch run.
     max_epochs: 10
     max_seq_len: 1000   # max frames per clip (after downsampling)
+
+  pose_pretrain:
+    # Dedicated masked-pose self-supervised pretraining (train_pose_pretrain.py)
+    # -- no mT5, encoder-only. Higher LR and masking ratio than phase1's
+    # 0.1-weighted auxiliary use, since this is the sole training signal.
+    # No differential LR needed (no MT5 to protect with a smaller rate).
+    batch_size: 8
+    grad_accum: 4
+    learning_rate: 1.0e-3
+    weight_decay: 0.01
+    warmup_steps: 1000
+    max_epochs: 100
+    max_seq_len: 1000
     max_text_len: 128   # max MT5 subword tokens (matches SimpleCollator)
 
   phase2:
