@@ -148,6 +148,20 @@ def main():
     hook.remove()
     pre_proj = captured['pre_proj']
 
+    # ---- (B3) per-group breakdown, before concatenation ----
+    # Hands load their CSL-pretrained weights exactly; body/face are mostly
+    # reinitialized (see load_unisign_weights). If the aggregate 1024-dim
+    # collapse is hiding a split -- hands actually discriminative, body/face
+    # collapsed -- concatenating them still gives ~1.0 aggregate cosine if
+    # body/face's near-constant output dominates in raw magnitude.
+    print("\n--- (B3) per-group embedding collapse (pre-concatenation) ---")
+    for gi, gname in enumerate(KeypointEncoder.MODES):
+        g = pre_proj[:, :, gi * 256:(gi + 1) * 256]
+        gm = torch.nn.functional.normalize(
+            torch.stack([g[b, :lengths[b]].mean(0) for b in range(B)]), dim=-1)
+        goffdiag = (gm @ gm.T - torch.eye(B, device=device)).max().item()
+        print(f"  {gname:10s}: pairwise cosine max offdiag={goffdiag:.4f}")
+
     part_para_norm = model.encoder.part_para.norm().item()
     per_clip_mean = torch.stack([pre_proj[b, :lengths[b]].mean(0) for b in range(B)])
     signal_spread = (per_clip_mean - per_clip_mean.mean(0, keepdim=True)).norm(dim=-1).mean().item()
