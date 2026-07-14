@@ -21,17 +21,29 @@ All were stored in bfloat16; converts to float32 to match this repo's
 training precision.
 
 --convert-pgf additionally converts rgb_support_backbone/rgb_proj (->
-models.pgf_fusion.HandBackbone), fusion_pose_rgb_DA + the sibling
+models.pgf_fusion.HandBackbone) and fusion_pose_rgb_DA + the sibling
 fusion_pose_rgb_linear (-> models.pgf_fusion.DeformablePoseRGBAttention),
-and fusion_gate (-> models.pgf_fusion.FusionGate), via
-load_state_dict(strict=False). Two of our modules have NO corresponding
-source key and are EXPECTED to show up as missing every time (judgment
-call #4, models/pgf_fusion.py's module docstring): rgb_adapter_down
-(inside DeformablePoseRGBAttention) and pgf_keypoint_adapter (built by
-UniSignMT5 itself, not converted here at all -- it has no equivalent in
-the colleague's architecture since their 256<->768 reconciliation seam is
-different from ours). Both stay at their fresh, randomly-initialized
-weights after conversion; this is correct, not a bug to chase.
+via load_state_dict(strict=False) -- both verified genuinely trained in
+the real checkpoint (100% and 99.76% nonzero params respectively). The
+sibling fusion_gate (-> models.pgf_fusion.FusionGate) is checked for the
+same signal and, in the real checkpoint, is NOT converted: every one of
+its 131,585 parameters is exactly zero, unlike the other two modules --
+not "trained then converged near our own zero-init" but apparently never
+trained at all. Loading it verbatim would give a constant g=sigmoid(0)=0.5
+(a full, untested 50/50 pose/RGB blend from step one), not the safe
+near-zero-but-alive start our own FusionGate's negative-bias init
+provides. _convert_pgf() detects this (source_is_all_zero) and keeps our
+own fresh gate init instead, reporting it loudly rather than silently
+inheriting an apparently-untrained module.
+
+Two of our modules have NO corresponding source key and are EXPECTED to
+show up as missing every time (judgment call #4, models/pgf_fusion.py's
+module docstring): rgb_adapter_down (inside DeformablePoseRGBAttention)
+and pgf_keypoint_adapter (built by UniSignMT5 itself, not converted here
+at all -- it has no equivalent in the colleague's architecture since
+their 256<->768 reconciliation seam is different from ours). Both stay at
+their fresh, randomly-initialized weights after conversion; this is
+correct, not a bug to chase.
 
 Output is loadable via train_encoder_mt5.py's --resume (encoder + mt5 +
 pose_norm/PGF all optional -- see the soft-fail paths in
@@ -70,7 +82,7 @@ def _convert_pgf(sd):
     hb_sd = {k: v.float() for k, v in sd.items() if k.startswith(hb_prefixes)}
     hb = HandBackbone(out_channels=256, pretrained=False)
     missing, unexpected = hb.load_state_dict(hb_sd, strict=False)
-    reports.append(('HandBackbone', missing, unexpected))
+    reports.append(('HandBackbone', missing, unexpected, None))
 
     # DeformablePoseRGBAttention: fusion_pose_rgb_DA.* keys strip their
     # prefix (our class's to_offsets/to_q/.../cross_attn are direct
@@ -87,18 +99,46 @@ def _convert_pgf(sd):
             da_sd[k] = v.float()
     da = DeformablePoseRGBAttention(embed_dim=256, adapter_dim=32, num_heads=8)
     missing, unexpected = da.load_state_dict(da_sd, strict=False)
-    reports.append(('DeformablePoseRGBAttention', missing, unexpected))
+    reports.append(('DeformablePoseRGBAttention', missing, unexpected, None))
 
     # FusionGate wraps its Sequential in self.net; checkpoint's fusion_gate
     # keys are top-level Sequential indices (fusion_gate.0.*, fusion_gate.2.*)
     # -- remap the prefix to net.
+    #
+    # Verified against the real checkpoint (2026-07-14): its fusion_gate is
+    # ALL ZERO across all 4 tensors (both conv layers, weight AND bias --
+    # 131,585/131,585 params), unlike HandBackbone (100% nonzero) and
+    # DeformablePoseRGBAttention (99.76% nonzero), which show clear evidence
+    # of real training. An all-zero gate isn't "trained then converged near
+    # our own zero-init" -- our own FusionGate only zero-inits the FINAL
+    # conv's weight and sets its bias to -6.0 specifically so g starts near
+    # 0 (pose-dominant) rather than at a literal 0. A gate with every
+    # parameter at exactly 0 produces pre-sigmoid output = 0 for ANY input,
+    # i.e. g = sigmoid(0) = 0.5 CONSTANT, ignoring pose/RGB content entirely
+    # -- a full, untested 50/50 blend from step one on our data, which is
+    # exactly the unsafe scenario our own negative-bias init is designed to
+    # avoid. So: only load the source gate if it shows real signal (not
+    # all-zero); otherwise keep our own safe fresh init and say so loudly,
+    # rather than silently inheriting an apparently-never-trained module.
     gate_sd = {}
     for k, v in sd.items():
         if k.startswith('fusion_gate.'):
             gate_sd['net.' + k[len('fusion_gate.'):]] = v.float()
     gate = FusionGate(embed_dim=256)
-    missing, unexpected = gate.load_state_dict(gate_sd, strict=False)
-    reports.append(('FusionGate', missing, unexpected))
+    source_is_all_zero = bool(gate_sd) and all(
+        v.abs().max().item() == 0.0 for v in gate_sd.values())
+    if source_is_all_zero:
+        reports.append(('FusionGate', [], [],
+                        'SOURCE IS ALL-ZERO (every one of the source gate\'s '
+                        f'{sum(v.numel() for v in gate_sd.values())} params) -- '
+                        'apparently never trained, unlike HandBackbone/'
+                        'DeformablePoseRGBAttention above. Kept our own safe '
+                        'negative-bias-init gate instead of loading a module '
+                        'that would give a constant g=0.5 (untested 50/50 '
+                        'pose/RGB blend) from step one.'))
+    else:
+        missing, unexpected = gate.load_state_dict(gate_sd, strict=False)
+        reports.append(('FusionGate', missing, unexpected, None))
 
     return hb.state_dict(), da.state_dict(), gate.state_dict(), reports
 
@@ -159,8 +199,10 @@ def main():
         out_ckpt['pgf_hand_fusion'] = da_sd
         out_ckpt['pgf_gate'] = gate_sd
         print("\n--convert-pgf key remapping report:")
-        for name, missing, unexpected in reports:
+        for name, missing, unexpected, note in reports:
             print(f"  {name}: {len(missing)} missing, {len(unexpected)} unexpected")
+            if note:
+                print(f"    {note}")
             if missing:
                 print(f"    missing (expected: rgb_adapter_down.* has no "
                       f"source key): {missing}")
