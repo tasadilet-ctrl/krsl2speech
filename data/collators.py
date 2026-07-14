@@ -86,6 +86,30 @@ class PoseTextCollator:
                 rgb_padded.append(r)
             rgb_tensor = torch.stack(rgb_padded, dim=0)  # (B, T, rgb_dim)
 
+        # Stack hand-crop fields for Prior-Guided Fusion (only if every
+        # sample in the batch has them -- same convention as rgb/prosody
+        # above). Each field is (T, 2, ...) per sample, hand axis
+        # [left, right]; padding stays False/0 at pad positions, which
+        # models/pgf_fusion.py's score-aware sampling will naturally
+        # avoid (padded frames are excluded via input_lengths, and
+        # hand_valid=False there anyway).
+        hand_crops_list = [b.get('hand_crops') for b in batch]
+        hand_crops_tensor = hand_ref_tensor = hand_valid_tensor = hand_score_tensor = None
+        if all(h is not None for h in hand_crops_list) and hand_crops_list:
+            def _pad_time(tensors, extra_shape, dtype):
+                out = []
+                for t in tensors:
+                    if t.shape[0] < max_kp_len:
+                        pad = torch.zeros((max_kp_len - t.shape[0],) + extra_shape, dtype=dtype)
+                        t = torch.cat([t, pad], dim=0)
+                    out.append(t)
+                return torch.stack(out, dim=0)
+
+            hand_crops_tensor = _pad_time(hand_crops_list, (2, 112, 112, 3), torch.uint8)
+            hand_ref_tensor = _pad_time([b['hand_ref'] for b in batch], (2, 2), torch.float32)
+            hand_valid_tensor = _pad_time([b['hand_valid'] for b in batch], (2,), torch.bool)
+            hand_score_tensor = _pad_time([b['hand_score'] for b in batch], (2,), torch.float32)
+
         return {
             'keypoints': kps_tensor,                          # (B, T, D)
             'input_lengths': torch.tensor(keypoint_lengths),  # (B,)
@@ -93,6 +117,10 @@ class PoseTextCollator:
             'text_lengths': torch.tensor(text_lengths),       # (B,)
             'prosody': prosody_tensor,                        # (B, C, T) or None
             'rgb': rgb_tensor,                                # (B, T, rgb_dim) or None
+            'hand_crops': hand_crops_tensor,                  # (B, T, 2, 112, 112, 3) uint8 or None
+            'hand_ref': hand_ref_tensor,                      # (B, T, 2, 2) or None
+            'hand_valid': hand_valid_tensor,                  # (B, T, 2) bool or None
+            'hand_score': hand_score_tensor,                  # (B, T, 2) or None
             'texts': [b['text'] for b in batch],
             'clip_ids': [b['clip_id'] for b in batch],
         }

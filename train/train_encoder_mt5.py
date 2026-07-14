@@ -101,6 +101,25 @@ class SimpleCollator:
             for i, r in enumerate(rgb_list):
                 rgb_padded[i, :r.shape[0], :] = r
 
+        # Pad hand-crop fields for Prior-Guided Fusion (only if every
+        # sample in the batch has them -- same "skip clips missing the
+        # file entirely via _blank_sample()" convention as rgb above, so
+        # partial coverage within a kept batch shouldn't normally happen
+        # once extraction covers all clips).
+        hand_crops_list = [b.get('hand_crops') for b in valid]
+        hand_crops_padded = hand_ref_padded = hand_valid_padded = hand_score_padded = None
+        if all(h is not None for h in hand_crops_list) and hand_crops_list:
+            def _pad_time(tensors, extra_shape, dtype):
+                out = torch.zeros((len(valid), max_t) + extra_shape, dtype=dtype)
+                for i, t in enumerate(tensors):
+                    out[i, :t.shape[0]] = t
+                return out
+
+            hand_crops_padded = _pad_time(hand_crops_list, (2, 112, 112, 3), torch.uint8)
+            hand_ref_padded = _pad_time([b['hand_ref'] for b in valid], (2, 2), torch.float32)
+            hand_valid_padded = _pad_time([b['hand_valid'] for b in valid], (2,), torch.bool)
+            hand_score_padded = _pad_time([b['hand_score'] for b in valid], (2,), torch.float32)
+
         # Tokenize text ONCE here (not every forward pass)
         texts = [b['text'].strip() for b in valid]
         if self.mt5_tokenizer is not None:
@@ -121,6 +140,10 @@ class SimpleCollator:
             'label_ids': label_ids,            # (B, L_text) — -100 for pads
             'label_attn_mask': label_attn,     # (B, L_text)
             'rgb': rgb_padded,                  # (B, T, rgb_dim) or None
+            'hand_crops': hand_crops_padded,    # (B, T, 2, 112, 112, 3) uint8 or None
+            'hand_ref': hand_ref_padded,        # (B, T, 2, 2) or None
+            'hand_valid': hand_valid_padded,    # (B, T, 2) bool or None
+            'hand_score': hand_score_padded,    # (B, T, 2) or None
             'texts': texts,                     # raw strings for generation eval
         }
 
@@ -687,7 +710,19 @@ class MT5Trainer:
 
         core = self.model.module if self.distributed else self.model
         core.encoder.load_state_dict(ckpt['encoder'])
-        core.pose_norm.load_state_dict(ckpt['pose_norm'])
+        # Unlike ctc_head/masked_pose_decoder/rgb_proj below, this used to be
+        # unconditional -- broke loading any checkpoint that never had a
+        # pose_norm bridge layer at all (e.g. an externally-sourced encoder+
+        # mt5 checkpoint converted from a different architecture that
+        # normalizes the pose embedding some other way, or doesn't need to).
+        # A missing key here just means pose_norm starts from its default
+        # (identity-ish) init and adapts during training, same tradeoff as
+        # the other optional components.
+        if 'pose_norm' in ckpt:
+            core.pose_norm.load_state_dict(ckpt['pose_norm'])
+        else:
+            log("[Resume] WARNING: checkpoint has no pose_norm -- starting "
+                "it from default init.")
 
         if self.use_lora:
             if 'mt5_lora' not in ckpt:
