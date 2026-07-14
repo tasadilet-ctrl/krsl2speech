@@ -148,8 +148,13 @@ def main():
           "'no valid samples' fallback WILL trigger for that hand/clip:")
     for b, (lf, rf) in enumerate(valid_frac_per_clip):
         print(f"  clip {b}: left={lf:.3f}  right={rf:.3f}")
-    overall_valid = hand_valid[:, :, :].float().mean().item()
-    print(f"overall hand_valid fraction across the whole batch: {overall_valid:.3f}\n")
+    # Length-aware (previous version wrongly averaged over padded frames,
+    # which are always False, silently dragging this number down).
+    valid_time = (torch.arange(hand_valid.size(1), device=device)[None, :]
+                 < lengths[:, None])  # (B, T)
+    overall_valid = hand_valid[valid_time].float().mean().item()
+    print(f"overall hand_valid fraction across the whole batch (length-aware): "
+          f"{overall_valid:.3f}\n")
 
     model.eval()
     with torch.no_grad():
@@ -164,9 +169,31 @@ def main():
         emb_pgf = model.encoder(kps, input_lengths=lengths, hand_fusion_fn=pgf_hook)
         cos_pgf = _collapse_cosine(emb_pgf, lengths)
 
-    print(f"=== collapse metric on {len(samples)} clips (higher = more collapsed) ===")
-    print(f"pose-only (no PGF):  max offdiag cosine = {cos_pose_only:.4f}")
-    print(f"PGF-active:          max offdiag cosine = {cos_pgf:.4f}")
+    # A cosine delta rounded to 4 decimals can hide a real-but-tiny effect
+    # (the gate blends in ~0.25% RGB at init by design) behind display
+    # precision. Report the raw embedding difference directly so "PGF had
+    # literally zero effect" (a bug -- the hook silently not firing) and
+    # "PGF had a real but currently-too-small-to-move-this-coarse-a-metric
+    # effect" (expected, needs training) are never confused for each other.
+    diff = (emb_pgf - emb_pose_only)
+    diff_l2 = diff.norm().item()
+    diff_max = diff.abs().max().item()
+    print(f"raw embedding difference (pose-only vs PGF-active): "
+          f"L2 norm={diff_l2:.8f}  max abs diff={diff_max:.8f}")
+    if diff_l2 == 0.0:
+        print("  L2 norm is EXACTLY zero -- the hook had literally no numeric "
+              "effect on the output. That's NOT consistent with a small-but-"
+              "real gate blend (sigmoid(-6) is representable in float32, not "
+              "zero) -- this points at a real bug (hook not actually being "
+              "invoked, or the scatter not landing), not just 'needs training'.")
+    else:
+        print(f"  Nonzero -- PGF IS measurably changing the output ({diff_l2:.8f}), "
+              f"just not by enough to move the 4-decimal cosine metric above. "
+              f"Consistent with the gate's near-zero init working as designed.")
+
+    print(f"\n=== collapse metric on {len(samples)} clips (higher = more collapsed) ===")
+    print(f"pose-only (no PGF):  max offdiag cosine = {cos_pose_only:.8f}")
+    print(f"PGF-active:          max offdiag cosine = {cos_pgf:.8f}")
     delta = cos_pgf - cos_pose_only
     if delta < -0.005:
         print(f"\nDROPPED by {-delta:.4f} -- PGF measurably reduces collapse "
