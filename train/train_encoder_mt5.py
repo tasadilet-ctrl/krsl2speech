@@ -919,7 +919,14 @@ class MT5Trainer:
                 "correctly).")
             self.global_step = 0
         self.start_epoch = ckpt.get('epoch', -1) + 1
-        self.best_loss = ckpt.get('val_loss', float('inf'))
+        # Coerce None to inf explicitly: a converted external checkpoint
+        # (scripts/convert_friend_checkpoint.py) stores val_loss=None, and
+        # dict.get's default only fires for a MISSING key, not a present-
+        # but-None one -- so best_loss would otherwise stay None and crash
+        # the :.4f format below (and later best-checkpoint comparisons).
+        self.best_loss = ckpt.get('val_loss')
+        if self.best_loss is None:
+            self.best_loss = float('inf')
         log(f"[Resume] checkpoint was at epoch {ckpt.get('epoch')} -> "
             f"continuing from epoch {self.start_epoch + 1}, "
             f"global_step={self.global_step}, best_loss={self.best_loss:.4f}")
