@@ -115,6 +115,10 @@ training:
     lambda_adv: 0.1
     lambda_recon: 1.0
     lambda_prosody: 5.0
+    # SignRecGAN paper losses (Manabe et al. Eq. 4-5); set to 0 to disable.
+    lambda_signrec: 1.0    # reconstruct sign-motion histograms from prosody
+    lambda_promo: 1.0      # cross-modal prior: energy~hand-motion, pitch~face-motion
+    promo_margin: 0.5
     max_epochs: 100
     max_seq_len: 1000
 

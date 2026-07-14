@@ -1,11 +1,127 @@
 """
 Prosody GAN (SignRecGAN) — maps sign latents to prosody features.
-Adapted from S2PFormer: Sign-to-Speech Prosody Transfer via Sign Reconstruction-based GAN.
+Adapted from S2PFormer: Sign-to-Speech Prosody Transfer via Sign Reconstruction-based GAN
+(Manabe et al., arXiv:2604.10413).
+
+Beyond the base generator/discriminator/L1-prosody design, this module
+implements the paper's two signature reconstruction losses (Sec 3.2-3.3),
+both of which operate purely on prosody + keypoints (no FastSpeech2 needed):
+  - SignRec loss: a small ProsodyEstimator reconstructs *sign-motion
+    histogram labels* (hand/face velocity+acceleration magnitude
+    distributions) FROM the generated prosody. If the generated prosody
+    can't reconstruct the sign's motion statistics, the two aren't
+    correlated -- this forces sign information into the prosody.
+  - ProMo loss: cross-modal prior regularizer aligning speech-energy with
+    hand-motion magnitude and speech-pitch with face-motion speed
+    (paper Eq. 5), so prosody moves in sympathy with the signing.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from data.utils import KEYPOINT_DIM
+
+# 282-dim keypoint layout (see data/utils.py KEYPOINT_GROUPS): body 0:22,
+# face 22:198 (88 nodes incl. lips), left_hand 198:240, right_hand 240:282.
+# The paper's sign-motion labels are computed over HANDS and FACE only.
+_FACE_SLICE = slice(22, 198)    # 88 nodes -> 176 dims
+_HANDS_SLICE = slice(198, 282)  # both hands, 42 nodes -> 84 dims
+
+
+def sign_motion_labels(keypoints, input_lengths=None, num_bins=16, eps=1e-6):
+    """
+    Paper Sec 3.2 "sign language prosody label": per-frame squared-magnitude
+    of hand/face velocity and acceleration, histogrammed over time into a
+    normalized distribution. Produces 4 target distributions per clip:
+    (hand-velocity, hand-accel, face-velocity, face-accel).
+
+    keypoints: (B, T, 282) -- any consistent per-frame keypoint
+        representation (offset/enriched-first-block both work; velocity is a
+        temporal difference, which stays a valid motion signal either way).
+    input_lengths: (B,) valid frame counts; padded frames excluded.
+
+    Returns: (B, 4, num_bins) float, each [:, m, :] a probability
+    distribution over bins (sums to 1). Computed under no_grad -- this is a
+    TARGET label for the SignRec cross-entropy, not a differentiable path.
+    """
+    with torch.no_grad():
+        B, T, _ = keypoints.shape
+        device = keypoints.device
+        parts = {'hand': keypoints[:, :, _HANDS_SLICE],
+                 'face': keypoints[:, :, _FACE_SLICE]}
+
+        labels = []
+        for name in ('hand', 'face'):
+            p = parts[name]                              # (B, T, 2*nodes)
+            p = p.reshape(B, T, -1, 2)                   # (B, T, nodes, 2)
+            vel = p[:, 1:] - p[:, :-1]                   # (B, T-1, nodes, 2)
+            acc = vel[:, 1:] - vel[:, :-1]               # (B, T-2, nodes, 2)
+            # squared magnitude summed over the point set -> scalar per frame
+            v_mag = (vel ** 2).sum(dim=-1).sum(dim=-1)   # (B, T-1)
+            a_mag = (acc ** 2).sum(dim=-1).sum(dim=-1)   # (B, T-2)
+
+            for mag, offset in ((v_mag, 1), (a_mag, 2)):
+                # valid frames: differencing drops `offset` frames off the end
+                if input_lengths is not None:
+                    valid_len = (input_lengths - offset).clamp(min=1)
+                else:
+                    valid_len = torch.full((B,), mag.size(1), device=device)
+                hist = torch.zeros(B, num_bins, device=device)
+                for b in range(B):
+                    L = int(valid_len[b].item())
+                    m = mag[b, :L]
+                    if m.numel() == 0:
+                        hist[b, 0] = 1.0
+                        continue
+                    # per-sample min-max normalize to [0,1] then bin
+                    m_norm = (m - m.min()) / (m.max() - m.min() + eps)
+                    idx = (m_norm * num_bins).long().clamp(0, num_bins - 1)
+                    hist[b].scatter_add_(0, idx, torch.ones_like(m))
+                    hist[b] /= hist[b].sum().clamp(min=eps)
+                labels.append(hist)
+
+        # order: hand-vel, hand-acc, face-vel, face-acc
+        return torch.stack(labels, dim=1)  # (B, 4, num_bins)
+
+
+class ProsodyEstimator(nn.Module):
+    """
+    Paper Sec 3.2: reconstructs the 4 sign-motion histogram labels FROM the
+    generated prosody (pitch, energy). A shallow temporal conv encoder over
+    the prosody sequence, mean-pooled, then a head per (part, motion-type)
+    producing a distribution over bins. Kept small on purpose -- its job is
+    to provide a reconstruction *signal* back into the generator, not to be
+    a strong model in its own right.
+    """
+
+    def __init__(self, prosody_dim=2, num_bins=16, hidden=64):
+        super().__init__()
+        self.num_bins = num_bins
+        self.encoder = nn.Sequential(
+            nn.Conv1d(prosody_dim, hidden, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(hidden, hidden, kernel_size=5, padding=2),
+            nn.GELU(),
+        )
+        # 4 heads: hand-vel, hand-acc, face-vel, face-acc
+        self.heads = nn.ModuleList([nn.Linear(hidden, num_bins) for _ in range(4)])
+
+    def forward(self, prosody, input_lengths=None):
+        """
+        prosody: (B, T, prosody_dim) -> (B, 4, num_bins) log-probabilities
+        (log-softmax over bins, ready for the SignRec cross-entropy).
+        """
+        x = prosody.transpose(1, 2)          # (B, prosody_dim, T)
+        h = self.encoder(x)                  # (B, hidden, T)
+        h = h.transpose(1, 2)                # (B, T, hidden)
+        if input_lengths is not None:
+            T = h.size(1)
+            mask = (torch.arange(T, device=h.device)[None, :]
+                    < input_lengths[:, None]).unsqueeze(-1)  # (B, T, 1)
+            pooled = (h * mask).sum(1) / mask.sum(1).clamp(min=1)
+        else:
+            pooled = h.mean(1)               # (B, hidden)
+        logits = torch.stack([head(pooled) for head in self.heads], dim=1)  # (B,4,num_bins)
+        return F.log_softmax(logits, dim=-1)
 
 
 class ProsodyGenerator(nn.Module):
@@ -183,7 +299,7 @@ class ProsodyGAN(nn.Module):
     """
 
     def __init__(self, d_model=512, prosody_dim=2, keypoint_dim=KEYPOINT_DIM,
-                 num_layers=4, nhead=8, dropout=0.1):
+                 num_layers=4, nhead=8, dropout=0.1, num_motion_bins=16):
         super().__init__()
         self.generator = ProsodyGenerator(
             d_model=d_model, prosody_dim=prosody_dim,
@@ -191,6 +307,10 @@ class ProsodyGAN(nn.Module):
             nhead=nhead, dropout=dropout,
         )
         self.discriminator = ProsodyDiscriminator(in_channels=prosody_dim)
+        # Paper SignRec: reconstructs sign-motion histograms from prosody.
+        self.num_motion_bins = num_motion_bins
+        self.prosody_estimator = ProsodyEstimator(
+            prosody_dim=prosody_dim, num_bins=num_motion_bins)
 
     def forward(self, sign_latent, input_lengths=None):
         """Forward pass for generator."""
@@ -208,9 +328,71 @@ class ProsodyGAN(nn.Module):
         denom = (mask.sum() * pred.shape[-1]).clamp(min=1)
         return diff.sum() / denom
 
+    @staticmethod
+    def _masked_mean(x, input_lengths=None):
+        """Per-clip mean over valid frames. x: (B, T) -> (B,)."""
+        if input_lengths is None:
+            return x.mean(dim=1)
+        B, T = x.shape
+        mask = (torch.arange(T, device=x.device)[None, :] < input_lengths[:, None]).float()
+        return (x * mask).sum(1) / mask.sum(1).clamp(min=1)
+
+    @staticmethod
+    def _standardize(v, eps=1e-6):
+        """Zero-mean/unit-std across the batch (differentiable)."""
+        return (v - v.mean()) / (v.std() + eps)
+
+    def signrec_loss(self, prosody_gen, keypoints, input_lengths=None, est_module=None):
+        """
+        Paper Eq. 4: L_SignRec = -1/4 sum_M sum_k P_M(k) log P_hat_M(k).
+        Target histograms P_M come from the keypoints (detached label);
+        P_hat_M is the ProsodyEstimator reading the GENERATED prosody, so
+        the gradient flows prosody_estimator -> prosody_gen -> generator.
+
+        est_module: optional DDP-wrapped ProsodyEstimator (same convention
+            as gen_module/disc_module) so the estimator's gradients sync
+            across ranks in distributed training; defaults to
+            self.prosody_estimator.
+        """
+        est = est_module if est_module is not None else self.prosody_estimator
+        target = sign_motion_labels(keypoints, input_lengths,
+                                    num_bins=self.num_motion_bins)  # (B,4,bins), no grad
+        log_pred = est(prosody_gen, input_lengths)  # (B,4,bins) log-probs
+        # cross-entropy per (part,motion), averaged over the 4 and the batch
+        ce = -(target * log_pred).sum(dim=-1)  # (B, 4)
+        return ce.mean()
+
+    def promo_loss(self, prosody_gen, keypoints, input_lengths=None, margin=0.5):
+        """
+        Paper Eq. 5 (cross-modal prior): speech ENERGY should track HAND
+        motion magnitude, speech PITCH should track FACE motion speed.
+        Margin-clipped L1 between batch-standardized per-clip means; the
+        prosody side carries gradient into the generator, the keypoint side
+        is a detached target. prosody_gen channels: [0]=F0/pitch, [1]=energy
+        (matches scripts/extract_asan_prosody.py's [F0, energy] convention).
+        """
+        pitch_mean = self._masked_mean(prosody_gen[:, :, 0], input_lengths)   # (B,)
+        energy_mean = self._masked_mean(prosody_gen[:, :, 1], input_lengths)  # (B,)
+
+        with torch.no_grad():
+            hands = keypoints[:, :, _HANDS_SLICE].reshape(keypoints.size(0), keypoints.size(1), -1, 2)
+            face = keypoints[:, :, _FACE_SLICE].reshape(keypoints.size(0), keypoints.size(1), -1, 2)
+            hand_vmag = ((hands[:, 1:] - hands[:, :-1]) ** 2).sum(-1).sum(-1)  # (B, T-1)
+            face_vmag = ((face[:, 1:] - face[:, :-1]) ** 2).sum(-1).sum(-1)    # (B, T-1)
+            vlen = (input_lengths - 1).clamp(min=1) if input_lengths is not None else None
+            hand_mean = self._masked_mean(hand_vmag, vlen)  # (B,)
+            face_mean = self._masked_mean(face_vmag, vlen)  # (B,)
+
+        z_energy, z_pitch = self._standardize(energy_mean), self._standardize(pitch_mean)
+        z_hand, z_face = self._standardize(hand_mean), self._standardize(face_mean)
+        e_term = F.relu((z_energy - z_hand).abs() - margin).mean()
+        p_term = F.relu((z_pitch - z_face).abs() - margin).mean()
+        return e_term + p_term
+
     def generator_loss(self, sign_latent, prosody_real, keypoints,
                        lambda_adv=0.1, lambda_prosody=5.0, lambda_recon=1.0,
-                       input_lengths=None, gen_module=None):
+                       lambda_signrec=1.0, lambda_promo=1.0, promo_margin=0.5,
+                       input_lengths=None, gen_module=None, est_module=None):
         """
         Compute generator losses.
 
@@ -218,6 +400,8 @@ class ProsodyGAN(nn.Module):
             gen_module: optional module to run the generator forward through
                 (pass the DDP-wrapped generator in distributed training so
                 gradients synchronize; defaults to self.generator).
+            lambda_signrec / lambda_promo: weights for the paper's SignRec
+                and ProMo losses (set to 0 to disable either).
 
         Returns:
             total_loss, loss_dict
@@ -235,13 +419,22 @@ class ProsodyGAN(nn.Module):
         # Keypoint reconstruction loss (prevents mode collapse)
         recon_loss = self._masked_l1(recon_kp, keypoints, input_lengths)
 
-        total = lambda_adv * adv_loss + lambda_prosody * prosody_loss + lambda_recon * recon_loss
+        # Paper's SignRec + ProMo losses (both on prosody_gen + keypoints)
+        signrec = self.signrec_loss(prosody_gen, keypoints, input_lengths,
+                                    est_module=est_module)
+        promo = self.promo_loss(prosody_gen, keypoints, input_lengths, margin=promo_margin)
+
+        total = (lambda_adv * adv_loss + lambda_prosody * prosody_loss
+                 + lambda_recon * recon_loss + lambda_signrec * signrec
+                 + lambda_promo * promo)
 
         return total, {
             'gen': total.item(),
             'adv': adv_loss.item(),
             'prosody': prosody_loss.item(),
             'recon': recon_loss.item(),
+            'signrec': signrec.item(),
+            'promo': promo.item(),
         }
 
     def discriminator_loss(self, sign_latent, prosody_real, input_lengths=None,

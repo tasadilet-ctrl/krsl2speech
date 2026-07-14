@@ -108,14 +108,23 @@ class ProsodyTrainer:
         # and calling them on .module would bypass gradient sync entirely.
         self.gen_ddp = None
         self.disc_ddp = None
+        self.est_ddp = None
         if self.distributed:
             self.gen_ddp = DDP(self.core.generator, device_ids=[local_rank],
                                output_device=local_rank)
             self.disc_ddp = DDP(self.core.discriminator, device_ids=[local_rank],
                                 output_device=local_rank)
+            # The prosody estimator is optimized alongside the generator (its
+            # SignRec gradient flows in the generator step); wrap it in its
+            # own DDP so its grads sync across ranks too.
+            self.est_ddp = DDP(self.core.prosody_estimator, device_ids=[local_rank],
+                               output_device=local_rank)
 
-        # Optimizers
-        g_params = list(self.core.generator.parameters())
+        # Optimizers -- the prosody estimator trains with the generator step,
+        # so its params go in optimizer_g (else SignRec's estimator never
+        # learns and its grads accumulate un-zeroed).
+        g_params = (list(self.core.generator.parameters())
+                    + list(self.core.prosody_estimator.parameters()))
         d_params = list(self.core.discriminator.parameters())
 
         self.optimizer_g = AdamW(g_params, lr=self.train_cfg.get('lr_generator', 1e-4), weight_decay=1e-5)
@@ -130,6 +139,10 @@ class ProsodyTrainer:
         self.lambda_adv = self.train_cfg.get('lambda_adv', 0.1)
         self.lambda_prosody = self.train_cfg.get('lambda_prosody', 5.0)
         self.lambda_recon = self.train_cfg.get('lambda_recon', 1.0)
+        # Paper's SignRec + ProMo losses (Manabe et al. Eq. 4-5); 0 disables.
+        self.lambda_signrec = self.train_cfg.get('lambda_signrec', 1.0)
+        self.lambda_promo = self.train_cfg.get('lambda_promo', 1.0)
+        self.promo_margin = self.train_cfg.get('promo_margin', 0.5)
 
         # Metrics
         self.best_prosody_loss = float('inf')
@@ -280,13 +293,19 @@ class ProsodyTrainer:
             g_loss, g_details = self.core.generator_loss(
                 encoder_out, prosody, kps_target,
                 self.lambda_adv, self.lambda_prosody, self.lambda_recon,
+                lambda_signrec=self.lambda_signrec, lambda_promo=self.lambda_promo,
+                promo_margin=self.promo_margin,
                 input_lengths=input_lens,
-                gen_module=self.gen_ddp,
+                gen_module=self.gen_ddp, est_module=self.est_ddp,
             )
             g_loss.backward()
             # Discriminator grads from the adversarial term are discarded by
             # optimizer_d.zero_grad() at the next iteration.
-            torch.nn.utils.clip_grad_norm_(self.core.generator.parameters(), max_norm=10.0)
+            # Clip generator + prosody-estimator together (both stepped by
+            # optimizer_g).
+            torch.nn.utils.clip_grad_norm_(
+                list(self.core.generator.parameters())
+                + list(self.core.prosody_estimator.parameters()), max_norm=10.0)
             self.optimizer_g.step()
 
             total_gen_loss += g_details['gen']
