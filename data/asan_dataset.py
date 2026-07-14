@@ -68,6 +68,8 @@ class AsanDataset(Dataset):
         min_hand_cov=0.0,        # drop clips with hand coverage below this
         load_prosody=False,      # Phase 2: load per-clip prosody .npy
         prosody_root=None,       # output root of scripts/extract_asan_prosody.py
+        load_rgb=False,          # optional second modality: per-clip RGB features
+        rgb_root=None,           # output root of scripts/extract_asan_rgb.py
         name=None,
     ):
         if split not in _SPLIT_FILES:
@@ -89,6 +91,17 @@ class AsanDataset(Dataset):
             split_dir = _SPLIT_FILES[split].replace('.json', '')
             self._prosody_dir = os.path.join(
                 os.path.expanduser(prosody_root), 'prosody', split_dir)
+
+        self.load_rgb = load_rgb
+        # extract_asan_rgb.py writes rgb/{train|dev|test}/{clip_id}.npy
+        self._rgb_dir = None
+        if load_rgb:
+            if not rgb_root:
+                raise ValueError("load_rgb=True requires rgb_root "
+                                 "(run scripts/extract_asan_rgb.py first)")
+            split_dir = _SPLIT_FILES[split].replace('.json', '')
+            self._rgb_dir = os.path.join(
+                os.path.expanduser(rgb_root), 'rgb', split_dir)
 
         self.clips = []
         n_filtered = 0
@@ -211,6 +224,24 @@ class AsanDataset(Dataset):
             except Exception:
                 return self._blank_sample()
 
+        # RGB (optional second modality): per-frame frozen-backbone features
+        # from scripts/extract_asan_rgb.py, resampled to keypoint length.
+        # Extraction already downsamples video at the same rate as pose, so
+        # this is normally a no-op -- resample_prosody returns the array
+        # unchanged when lengths already match (its early-return path), so
+        # no interpolation happens in the common case. Resampling only
+        # actually kicks in for the max_frames-truncation case above, or a
+        # rare video/pose frame-count mismatch from independent decoding.
+        rgb = None
+        if self.load_rgb:
+            rgb_npy = os.path.join(self._rgb_dir, f"{entry.get('clip_id', '')}.npy")
+            if not os.path.exists(rgb_npy):
+                return self._blank_sample()  # skip clips without RGB features
+            try:
+                rgb = resample_prosody(np.load(rgb_npy), len(kps))
+            except Exception:
+                return self._blank_sample()
+
         text = entry['text']
         text_ids = self.tokenizer.encode(text) if self.tokenizer else None
 
@@ -218,6 +249,8 @@ class AsanDataset(Dataset):
             'keypoints': torch.tensor(kps, dtype=torch.float32),
             'prosody': (torch.tensor(prosody, dtype=torch.float32)
                         if prosody is not None else None),
+            'rgb': (torch.tensor(rgb, dtype=torch.float32)
+                   if rgb is not None else None),
             'text': text,
             'text_ids': (torch.tensor(text_ids, dtype=torch.long)
                          if text_ids is not None else None),
@@ -230,6 +263,7 @@ class AsanDataset(Dataset):
         return {
             'keypoints': torch.zeros(1, dim),
             'prosody': None,
+            'rgb': None,
             'text': '',
             'text_ids': torch.empty(0, dtype=torch.long),
             'input_length': 0,

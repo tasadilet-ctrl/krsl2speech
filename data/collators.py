@@ -71,12 +71,28 @@ class PoseTextCollator:
                 pros_padded.append(p)
             prosody_tensor = torch.stack(pros_padded, dim=0).transpose(1, 2)  # (B, C, T)
 
+        # Stack RGB features (only if every sample in the batch has them).
+        # Kept as (B, T, rgb_dim) -- NOT transposed like prosody -- since
+        # this is meant to be fused with pose_emb (B, T, 768) per frame,
+        # not consumed as an audio-style (B, C, T) channel stack.
+        rgb_list = [b.get('rgb') for b in batch]
+        rgb_tensor = None
+        if all(r is not None for r in rgb_list) and rgb_list:
+            rgb_padded = []
+            for r in rgb_list:
+                if r.shape[0] < max_kp_len:
+                    pad = torch.zeros(max_kp_len - r.shape[0], r.shape[1])
+                    r = torch.cat([r, pad], dim=0)
+                rgb_padded.append(r)
+            rgb_tensor = torch.stack(rgb_padded, dim=0)  # (B, T, rgb_dim)
+
         return {
             'keypoints': kps_tensor,                          # (B, T, D)
             'input_lengths': torch.tensor(keypoint_lengths),  # (B,)
             'text_ids': text_ids_padded,                      # (B, L)
             'text_lengths': torch.tensor(text_lengths),       # (B,)
             'prosody': prosody_tensor,                        # (B, C, T) or None
+            'rgb': rgb_tensor,                                # (B, T, rgb_dim) or None
             'texts': [b['text'] for b in batch],
             'clip_ids': [b['clip_id'] for b in batch],
         }
