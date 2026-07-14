@@ -517,3 +517,74 @@ def resample_prosody(prosody, target_len):
         axis=1,
     )
     return out.astype(np.float32)
+
+
+def _nearest_indices(t_src, target_len):
+    """
+    Index map for nearest-neighbor resampling: unlike resample_prosody's
+    linear interpolation (fine for continuous signals like F0/energy),
+    hand-crop images, validity booleans, and reference-point coordinates
+    can't be blended between two source frames -- nearest-neighbor is the
+    only sound choice.
+    """
+    if t_src == 0 or target_len <= 0:
+        return np.zeros((max(target_len, 0),), dtype=np.int64)
+    if t_src == target_len:
+        return np.arange(t_src, dtype=np.int64)
+    src_x = np.linspace(0.0, t_src - 1, target_len)
+    return np.round(src_x).astype(np.int64).clip(0, t_src - 1)
+
+
+def resample_hand_crops(crops, target_len):
+    """
+    Nearest-neighbor resample a hand-crop image sequence to `target_len`
+    frames. Extraction already downsamples video at the pose frame rate,
+    so this is normally a no-op (same early-return-equivalent behavior as
+    resample_prosody when lengths already match) -- it only actually
+    resamples for the rare max_frames-truncation / independent-decoding
+    mismatch case.
+
+    Args:
+        crops: (T_src, H, W, 3) uint8 array
+        target_len: desired number of frames
+
+    Returns:
+        (target_len, H, W, 3) uint8 array
+    """
+    crops = np.asarray(crops)
+    if crops.ndim != 4:
+        raise ValueError(f"expected (T,H,W,3), got shape {crops.shape}")
+    if len(crops) == 0 or target_len <= 0:
+        return np.zeros((max(target_len, 0),) + crops.shape[1:], dtype=crops.dtype)
+    idx = _nearest_indices(len(crops), target_len)
+    return crops[idx]
+
+
+def resample_hand_meta(ref, valid, score, target_len):
+    """
+    Nearest-neighbor resample a hand's per-frame reference points, validity
+    mask, and confidence scores to `target_len` frames (same alignment
+    convention as resample_hand_crops -- must use the SAME index map so a
+    given output frame's crop/ref/valid/score all come from the same
+    source frame).
+
+    Args:
+        ref: (T_src, 2) float32 -- normalized [-1,1] wrist reference point
+        valid: (T_src,) bool -- whether that frame's crop is trustworthy
+        score: (T_src,) float32 -- mean keypoint confidence
+        target_len: desired number of frames
+
+    Returns:
+        (ref, valid, score) each resampled to length target_len
+    """
+    ref = np.asarray(ref, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool)
+    score = np.asarray(score, dtype=np.float32)
+    t_src = len(ref)
+    if t_src == 0 or target_len <= 0:
+        n = max(target_len, 0)
+        return (np.zeros((n, 2), dtype=np.float32),
+                np.zeros((n,), dtype=bool),
+                np.zeros((n,), dtype=np.float32))
+    idx = _nearest_indices(t_src, target_len)
+    return ref[idx], valid[idx], score[idx]
