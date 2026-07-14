@@ -57,7 +57,7 @@ from train.train_encoder_mt5 import build_pose_mask
 class PosePretrainer:
     def __init__(self, config_path='configs/config.yaml', pretrained_unisign=None,
                  pretrained_encoder=None, use_enriched=False, masked_pose_ratio=0.2,
-                 grad_accum=None, freeze_spatial=False):
+                 grad_accum=None, freeze_spatial=False, num_workers=4, pin_memory=True):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
         from utils.paths import apply_env_overrides
@@ -104,6 +104,8 @@ class PosePretrainer:
         self.best_loss = float('inf')
         self.global_step = 0
         self.scheduler = None
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
 
         n_enc = sum(p.numel() for p in self.encoder.parameters())
         n_trainable = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
@@ -133,12 +135,19 @@ class PosePretrainer:
         val_set = AsanDataset(split='val', **common)
         collator = AsanCollator()
         batch_size = self.train_cfg.get('batch_size', 8)
+        # num_workers/pin_memory are overridable (--num-workers/--no-pin-memory)
+        # since a persistent CUDA launch timeout traced back to this exact
+        # combination (multi-process workers + pinned-memory transfers) on
+        # one box -- num_workers=0 avoids subprocess workers entirely,
+        # --no-pin-memory avoids the pinned-memory CUDA path specifically.
         train_loader = DataLoader(
-            train_set, batch_size=batch_size, shuffle=True, num_workers=4,
-            collate_fn=collator, pin_memory=True, persistent_workers=True)
+            train_set, batch_size=batch_size, shuffle=True,
+            num_workers=self.num_workers, collate_fn=collator,
+            pin_memory=self.pin_memory, persistent_workers=self.num_workers > 0)
         val_loader = DataLoader(
-            val_set, batch_size=batch_size, shuffle=False, num_workers=2,
-            collate_fn=collator, pin_memory=True)
+            val_set, batch_size=batch_size, shuffle=False,
+            num_workers=min(self.num_workers, 2), collate_fn=collator,
+            pin_memory=self.pin_memory)
         print(f"[PosePretrain Datasets] train={len(train_set)}, val={len(val_set)}")
         return train_loader, val_loader
 
@@ -267,6 +276,13 @@ def main():
     parser.add_argument('--grad-accum', type=int, default=None)
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--save-dir', default=None)
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='DataLoader worker processes. Set to 0 to '
+                             'rule out multi-process-worker/pinned-memory '
+                             'CUDA issues (a recurring cudaErrorLaunchTimeout '
+                             'traced back to this combination on one box).')
+    parser.add_argument('--no-pin-memory', action='store_true',
+                        help='Disable pinned-memory transfers (see --num-workers).')
     args = parser.parse_args()
 
     trainer = PosePretrainer(
@@ -277,6 +293,8 @@ def main():
         masked_pose_ratio=args.masked_pose_ratio,
         grad_accum=args.grad_accum,
         freeze_spatial=args.freeze_spatial,
+        num_workers=args.num_workers,
+        pin_memory=not args.no_pin_memory,
     )
     trainer.train(num_epochs=args.epochs, save_dir=args.save_dir)
 
