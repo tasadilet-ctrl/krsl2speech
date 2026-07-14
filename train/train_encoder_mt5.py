@@ -89,6 +89,18 @@ class SimpleCollator:
         for i, k in enumerate(kps):
             kps_padded[i, :k.shape[0], :] = k
 
+        # Pad RGB features (only if every sample in the batch has them --
+        # AsanDataset.__getitem__ already skips clips missing an rgb file
+        # entirely when load_rgb=True, via _blank_sample(), so partial
+        # coverage within a kept batch shouldn't normally happen once
+        # extraction covers all clips).
+        rgb_list = [b.get('rgb') for b in valid]
+        rgb_padded = None
+        if all(r is not None for r in rgb_list) and rgb_list:
+            rgb_padded = torch.zeros(len(valid), max_t, rgb_list[0].shape[1], dtype=torch.float32)
+            for i, r in enumerate(rgb_list):
+                rgb_padded[i, :r.shape[0], :] = r
+
         # Tokenize text ONCE here (not every forward pass)
         texts = [b['text'].strip() for b in valid]
         if self.mt5_tokenizer is not None:
@@ -108,6 +120,7 @@ class SimpleCollator:
             'input_lengths': input_lengths,
             'label_ids': label_ids,            # (B, L_text) — -100 for pads
             'label_attn_mask': label_attn,     # (B, L_text)
+            'rgb': rgb_padded,                  # (B, T, rgb_dim) or None
             'texts': texts,                     # raw strings for generation eval
         }
 
@@ -200,7 +213,7 @@ class UniSignMT5(nn.Module):
     """
 
     def __init__(self, encoder, mt5_path=MT5_PATH, lang="Kazakh",
-                 masked_pose_dim=None, ctc_vocab_size=None):
+                 masked_pose_dim=None, ctc_vocab_size=None, rgb_dim=None):
         """
         Args:
             encoder: KeypointEncoder
@@ -215,6 +228,16 @@ class UniSignMT5(nn.Module):
                 align with the transcript — the standard fix when the decoder
                 degenerates into a pure language model (fluent output, wrong
                 content) because CE alone lets it ignore the video.
+            rgb_dim: if set, build an RGB fusion path (rgb_dim → d_model
+                projection + LayerNorm, then concat-and-project with the
+                pose embedding). Pose-only diagnostics (diagnose_phase1.py)
+                found the encoder's embeddings collapse to near-identical
+                across genuinely different clips even after real training,
+                with six architecture/training-side explanations ruled out
+                by direct testing — this tests whether pose-only input was
+                discarding exactly the fine finger/facial detail RGB can
+                supply. Frame-aligned per-clip features come from
+                scripts/extract_asan_rgb.py (frozen DINOv2 backbone).
         """
         super().__init__()
         self.encoder = encoder
@@ -234,6 +257,22 @@ class UniSignMT5(nn.Module):
         if masked_pose_dim is not None:
             self.masked_pose_decoder = build_masked_pose_decoder(
                 encoder.hidden_dim, masked_pose_dim)
+
+        # RGB fusion: project to d_model with its own LayerNorm (mirrors
+        # pose_norm's role but scoped to RGB's own scale, independent of
+        # pose's), then concat with the (already pose_norm'd) pose
+        # embedding and project back to d_model. Concat-then-project (not a
+        # plain residual add) lets the model learn arbitrary interactions
+        # between the two modalities rather than being constrained to pure
+        # addition — reasonable complexity for a first validation of
+        # whether RGB helps at all, not the final production fusion.
+        self.rgb_proj = None
+        self.fusion = None
+        if rgb_dim is not None:
+            d_model = encoder.hidden_dim
+            self.rgb_proj = nn.Sequential(
+                nn.Linear(rgb_dim, d_model), nn.LayerNorm(d_model))
+            self.fusion = nn.Linear(d_model * 2, d_model)
 
         # MT5
         self.mt5 = MT5ForConditionalGeneration.from_pretrained(mt5_path)
@@ -267,8 +306,21 @@ class UniSignMT5(nn.Module):
         return (torch.arange(t_max, device=device)[None, :]
                 < input_lengths.to(device)[:, None]).long()  # (B, T)
 
+    def _fuse_rgb(self, pose_emb, rgb):
+        """
+        pose_emb: (B, T, d_model), already pose_norm'd.
+        rgb: (B, T, rgb_dim) or None -- frame-aligned features from
+            scripts/extract_asan_rgb.py, or None if this call doesn't
+            supply RGB (e.g. --use-rgb wasn't set, so rgb_proj/fusion were
+            never built and this is a no-op).
+        """
+        if self.rgb_proj is None or rgb is None:
+            return pose_emb
+        rgb_feat = self.rgb_proj(rgb)  # (B, T, d_model)
+        return self.fusion(torch.cat([pose_emb, rgb_feat], dim=-1))  # (B, T, d_model)
+
     def forward(self, kps, label_ids, label_attn_mask, input_lengths=None,
-                kps_target=None, frame_mask=None):
+                kps_target=None, frame_mask=None, rgb=None):
         """
         Training forward pass.
 
@@ -280,6 +332,8 @@ class UniSignMT5(nn.Module):
             kps_target: (B, T, D) — clean keypoints (masked-pose aux target)
             frame_mask: (B, T, 1) or (B, T, D) — True at masked entries
                 (broadcasts over D; supports frame- and joint-level masks)
+            rgb: (B, T, rgb_dim) — frame-aligned RGB features, or None
+                (no-op unless the model was built with rgb_dim set)
 
         Returns:
             loss: scalar CE loss
@@ -296,6 +350,7 @@ class UniSignMT5(nn.Module):
         # input_lengths re-zeroes pad frames before the encoder's temporal
         # conv so batch padding can't bleed into real boundary frames.
         pose_emb = self.pose_norm(self.encoder(kps, input_lengths=input_lengths))  # (B, T, 768)
+        pose_emb = self._fuse_rgb(pose_emb, rgb)
 
         # Prefix embeds: re-embed each forward for grad correctness
         # (~10 token lookup is free, avoids backward-through-cached-graph bugs)
@@ -340,7 +395,8 @@ class UniSignMT5(nn.Module):
 
         return out.loss, mse_loss, ctc_log_probs
 
-    def generate(self, kps, input_lengths=None, max_new_tokens=128, num_beams=4):
+    def generate(self, kps, input_lengths=None, max_new_tokens=128, num_beams=4,
+                rgb=None):
         """
         Inference: generate text from keypoints.
 
@@ -349,6 +405,7 @@ class UniSignMT5(nn.Module):
             input_lengths: (B,) — true frame counts (optional)
             max_new_tokens: max output tokens
             num_beams: beam width
+            rgb: (B, T, rgb_dim) — frame-aligned RGB features, or None
 
         Returns:
             list of decoded strings
@@ -356,6 +413,7 @@ class UniSignMT5(nn.Module):
         B = kps.size(0)
 
         pose_emb = self.pose_norm(self.encoder(kps, input_lengths=input_lengths))  # (B, T, 768)
+        pose_emb = self._fuse_rgb(pose_emb, rgb)
 
         prefix_embeds = self.mt5.shared(self.prefix_ids.unsqueeze(0).expand(B, -1))
         prefix_attn = self.prefix_attn.unsqueeze(0).expand(B, -1)
@@ -391,7 +449,8 @@ class MT5Trainer:
                  freeze_spatial=False, use_lora=False, lora_r=16, lora_alpha=32,
                  use_enriched=False, masked_pose_ratio=0.0, overfit_n=0,
                  ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
-                 grad_accum=None, encoder_lr=None):
+                 grad_accum=None, encoder_lr=None,
+                 use_rgb=False, rgb_root=None, rgb_dim=384):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
         from utils.paths import apply_env_overrides
@@ -406,6 +465,9 @@ class MT5Trainer:
         self.overfit_n = overfit_n
         self.ctc_weight = ctc_weight
         self.freeze_spatial = freeze_spatial
+        self.use_rgb = use_rgb
+        self.rgb_root = rgb_root
+        self.rgb_dim = rgb_dim
         # Flags that determine model/optimizer structure — saved into the
         # checkpoint so --resume can verify the resuming run uses the same
         # architecture (a mismatch here breaks state_dict loads far less
@@ -414,6 +476,7 @@ class MT5Trainer:
             use_enriched=use_enriched, masked_pose_ratio=masked_pose_ratio,
             ctc_weight=ctc_weight, ctc_vocab_size=ctc_vocab_size,
             freeze_spatial=freeze_spatial, use_lora=use_lora,
+            use_rgb=use_rgb, rgb_dim=rgb_dim if use_rgb else None,
         )
 
         # Subword-BPE vocabulary for the CTC auxiliary loss (id 0 = blank).
@@ -461,10 +524,15 @@ class MT5Trainer:
             encoder=self.encoder, lang="Kazakh",
             masked_pose_dim=input_dim if masked_pose_ratio > 0 else None,
             ctc_vocab_size=self.ctc_vocab_size if self.ctc_tokenizer else None,
+            rgb_dim=rgb_dim if use_rgb else None,
         )
         if masked_pose_ratio > 0:
             log(f"[Masked Pose] Reconstruction decoder: {self.cfg['d_model']} → {input_dim}")
             log(f"[Masked Pose] Mask ratio: {masked_pose_ratio}")
+        if use_rgb:
+            log(f"[RGB] Fusion enabled: {rgb_dim} → {self.cfg['d_model']} "
+                f"(concat + project with pose_emb)")
+            log(f"[RGB] Feature root: {rgb_root}")
 
         # --- LoRA setup (optional, via peft) ---
         # MUST happen BEFORE the DDP wrap: DDP registers parameters at wrap
@@ -536,6 +604,10 @@ class MT5Trainer:
 
         if core.ctc_head is not None:
             param_groups.append({'params': core.ctc_head.parameters(), 'lr': base_lr})
+
+        if core.rgb_proj is not None:
+            param_groups.append({'params': core.rgb_proj.parameters(), 'lr': base_lr})
+            param_groups.append({'params': core.fusion.parameters(), 'lr': base_lr})
 
         self.optimizer = AdamW(param_groups, weight_decay=0.01)
 
@@ -640,6 +712,13 @@ class MT5Trainer:
                                  "checkpoint has no masked-pose decoder.")
             core.masked_pose_decoder.load_state_dict(ckpt['masked_pose_decoder'])
 
+        if core.rgb_proj is not None:
+            if 'rgb_proj' not in ckpt or 'fusion' not in ckpt:
+                raise ValueError("[Resume] --use-rgb is set but the "
+                                 "checkpoint has no rgb_proj/fusion weights.")
+            core.rgb_proj.load_state_dict(ckpt['rgb_proj'])
+            core.fusion.load_state_dict(ckpt['fusion'])
+
         if 'optimizer' in ckpt:
             self.optimizer.load_state_dict(ckpt['optimizer'])
             self.global_step = ckpt.get('global_step', 0)
@@ -728,6 +807,13 @@ class MT5Trainer:
                 use_enriched=self.use_enriched,
                 skip_low_quality=asan_cfg.get('skip_low_quality', True),
                 min_hand_cov=asan_cfg.get('min_hand_cov', 0.0),
+                # RGB is only extracted for asan-dataset (khabar_kz/informburo
+                # below have no RGB support) -- a batch mixing sources would
+                # just see rgb=None for that batch (SimpleCollator only
+                # stacks it when every sample in the batch has it), not a
+                # crash, but in practice asan is ~10x the other sources so
+                # this is a non-issue.
+                load_rgb=self.use_rgb, rgb_root=self.rgb_root,
             )
             all_train.append(AsanDataset(split='train', **asan_common))
             all_val.append(AsanDataset(split='val', **asan_common))
@@ -858,6 +944,7 @@ class MT5Trainer:
             label_ids = batch['label_ids'].to(self.device)
             label_attn = batch['label_attn_mask'].to(self.device)
             input_lengths = batch['input_lengths'].to(self.device)
+            rgb = batch['rgb'].to(self.device) if batch.get('rgb') is not None else None
 
             # --- Masked-pose reconstruction (multi-granularity:
             #     joint / frame / span, SignBERT+-style) ---
@@ -873,6 +960,7 @@ class MT5Trainer:
                 input_lengths=input_lengths,
                 kps_target=kps if mask is not None else None,
                 frame_mask=mask,
+                rgb=rgb,
             )
             if mse_loss is None:
                 mse_loss = torch.tensor(0.0, device=self.device)
@@ -975,10 +1063,11 @@ class MT5Trainer:
             label_ids = batch['label_ids'].to(self.device)
             label_attn = batch['label_attn_mask'].to(self.device)
             input_lengths = batch['input_lengths'].to(self.device)
+            rgb = batch['rgb'].to(self.device) if batch.get('rgb') is not None else None
             texts = batch['texts']
 
             loss, _, _ = self.model(kps, label_ids, label_attn,
-                                    input_lengths=input_lengths)
+                                    input_lengths=input_lengths, rgb=rgb)
             if not torch.isfinite(loss):
                 continue
 
@@ -988,7 +1077,7 @@ class MT5Trainer:
             if is_main() and num_batches <= max_gen_batches:
                 try:
                     core = self.model.module if self.distributed else self.model
-                    hyps = core.generate(kps, input_lengths=input_lengths)
+                    hyps = core.generate(kps, input_lengths=input_lengths, rgb=rgb)
                     all_hyps.extend(hyps)
                     all_refs.extend(texts)
                 except Exception as e:
@@ -1050,6 +1139,9 @@ class MT5Trainer:
             ckpt['mt5'] = core.mt5.state_dict()
         if core.masked_pose_decoder is not None:
             ckpt['masked_pose_decoder'] = core.masked_pose_decoder.state_dict()
+        if core.rgb_proj is not None:
+            ckpt['rgb_proj'] = core.rgb_proj.state_dict()
+            ckpt['fusion'] = core.fusion.state_dict()
         return ckpt
 
     def train(self, num_epochs=None, save_dir=None):
@@ -1195,7 +1287,21 @@ def main():
                              '--ctc-vocab-size/--freeze-spatial/--use-lora '
                              'flags the checkpoint was trained with. Overrides '
                              '--pretrained-encoder/--pretrained-unisign.')
+    parser.add_argument('--use-rgb', action='store_true',
+                        help='Fuse RGB features (scripts/extract_asan_rgb.py '
+                             'output) with the pose embedding before mT5. '
+                             'Requires --rgb-root pointing at the extraction '
+                             'output directory.')
+    parser.add_argument('--rgb-root', default=None,
+                        help='Output root of scripts/extract_asan_rgb.py '
+                             '(the --out passed to that script).')
+    parser.add_argument('--rgb-dim', type=int, default=384,
+                        help='RGB feature dimension (384 for the default '
+                             'facebook/dinov2-small backbone).')
     args = parser.parse_args()
+
+    if args.use_rgb and not args.rgb_root:
+        parser.error("--use-rgb requires --rgb-root")
 
     if args.resume and (args.pretrained_encoder or args.pretrained_unisign):
         print("[WARN] --resume overrides --pretrained-encoder/--pretrained-unisign "
@@ -1233,6 +1339,9 @@ def main():
         resume=args.resume,
         grad_accum=args.grad_accum,
         encoder_lr=args.encoder_lr,
+        use_rgb=args.use_rgb,
+        rgb_root=args.rgb_root,
+        rgb_dim=args.rgb_dim,
     )
 
     trainer.train(num_epochs=args.epochs, save_dir=args.save_dir)
