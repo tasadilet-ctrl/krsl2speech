@@ -29,6 +29,25 @@ from models.unisign_encoder import KeypointEncoder, load_unisign_weights
 from train.train_encoder_mt5 import UniSignMT5, SimpleCollator
 
 
+def _cosine_shift_verdict(before, after, drop_means, rise_means, threshold=0.005):
+    """
+    before/after: pairwise clip-embedding cosine collapse metric (HIGHER =
+    MORE collapsed, i.e. embeddings more similar across different clips).
+    The three call sites below previously printed a hardcoded "a real
+    drop confirms X" string regardless of which direction the number
+    actually moved -- on several real runs the metric went UP (more
+    collapsed) after the ablation, making the printed conclusion say the
+    opposite of what happened. This picks the right direction's
+    explanation instead of assuming one.
+    """
+    delta = after - before
+    if delta < -threshold:
+        return f"{before:.4f} -> {after:.4f} (dropped): {drop_means}"
+    elif delta > threshold:
+        return f"{before:.4f} -> {after:.4f} (rose, not dropped): {rise_means}"
+    return f"{before:.4f} -> {after:.4f} (~unchanged): neither ablation direction applies here"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default='configs/config.yaml')
@@ -201,10 +220,14 @@ def main():
     cos2 = m2 @ m2.T
     before = (cos - torch.eye(B, device=device)).max().item()
     after = (cos2 - torch.eye(B, device=device)).max().item()
-    print(f"pairwise clip cosine WITHOUT part_para/bias: max offdiag={after:.4f} "
-          f"(was {before:.4f} with them) — a big drop confirms these additive "
-          f"terms were swamping the signal; still ≈1.0 here → the collapse "
-          f"happens earlier (GCN/BatchNorm layers), not at this final step")
+    verdict = _cosine_shift_verdict(
+        before, after,
+        drop_means="part_para/bias WAS swamping real per-clip signal -- "
+                   "removing it reveals more discriminative embeddings",
+        rise_means="part_para/bias is NOT the cause -- collapse persists (or "
+                   "worsens) even without it, so it originates earlier "
+                   "(GCN/BatchNorm layers), not at this final step")
+    print(f"pairwise clip cosine WITHOUT part_para/bias: {verdict}")
 
     # ---- (D) Decoder cross-attention: mean-pooling over T (used by (B)/(B3)
     #      above) is NOT what the real model does -- UniSignMT5.forward feeds
@@ -231,9 +254,14 @@ def main():
         a = last_layer_attn[b, :valid_dec]  # (dec_len, P+T)
         prefix_mass = a[:, :P].sum(-1).mean().item()
         pose_mass = a[:, P:P + int(lengths[b])].sum(-1).mean().item()
+        if pose_mass < 0.2:
+            note = "decoder ignores the video entirely, regardless of what the encoder produces"
+        else:
+            note = ("decoder DOES attend to the pose stream -- if generations "
+                    "still ignore content, the problem is what the encoder puts "
+                    "there (see B/B3), not decoder-side attention starvation")
         print(f"clip {b}: attention mass on prefix={prefix_mass:.3f}  "
-              f"pose={pose_mass:.3f} (pose≈0 → decoder ignores the video "
-              f"entirely, regardless of what the encoder produces)")
+              f"pose={pose_mass:.3f} ({note})")
 
     # ---- (F) BatchNorm running-stats reset ablation ----
     # Every GCN_unit's nn.BatchNorm2d tracks running_mean/running_var via a
@@ -263,11 +291,17 @@ def main():
     m4 = torch.nn.functional.normalize(
         torch.stack([emb_bn_reset[b, :lengths[b]].mean(0) for b in range(B)]), dim=-1)
     bn_offdiag = (m4 @ m4.T - torch.eye(B, device=device)).max().item()
-    print(f"{len(bn_modules)} BatchNorm2d modules reset | pairwise clip "
-          f"cosine: max offdiag={bn_offdiag:.4f} "
-          f"(was {(cos - torch.eye(B, device=device)).max().item():.4f} with "
-          f"the loaded running stats -- a real drop implicates stale BN "
-          f"calibration; unchanged rules it out too)")
+    bn_before = (cos - torch.eye(B, device=device)).max().item()
+    verdict = _cosine_shift_verdict(
+        bn_before, bn_offdiag,
+        drop_means="stale BN calibration WAS contributing to the collapse -- "
+                   "resetting to untrained defaults reveals more discriminative "
+                   "embeddings",
+        rise_means="the TRAINED BN running stats are contributing real (if "
+                   "insufficient) discriminative signal -- resetting to "
+                   "untrained defaults makes collapse worse, so stale "
+                   "calibration is not the root cause")
+    print(f"{len(bn_modules)} BatchNorm2d modules reset | pairwise clip cosine: {verdict}")
 
     # ---- (C) Fixed-LR memorization ----
     # Differential LR (encoder vs. rest) so --encoder-lr can test whether
@@ -333,10 +367,17 @@ def main():
     m3 = torch.nn.functional.normalize(
         torch.stack([emb_post[b, :lengths[b]].mean(0) for b in range(B)]), dim=-1)
     post_offdiag = (m3 @ m3.T - torch.eye(B, device=device)).max().item()
-    print(f"pairwise clip cosine after memorization: max offdiag={post_offdiag:.4f} "
-          f"(was {(cos - torch.eye(B, device=device)).max().item():.4f} before "
-          f"-- a real drop means this encoder_lr helps the encoder actually "
-          f"discriminate; unchanged means raising it alone isn't the fix)")
+    pre_mem = (cos - torch.eye(B, device=device)).max().item()
+    verdict = _cosine_shift_verdict(
+        pre_mem, post_offdiag,
+        drop_means=f"encoder_lr={enc_lr} lets the encoder actually learn to "
+                   f"discriminate these clips, at least on this toy set",
+        rise_means=f"raising encoder_lr to {enc_lr} alone isn't the fix -- "
+                   f"the CE/HYP results above may still look fine because the "
+                   f"decoder memorizes text directly (see D's finding that it "
+                   f"attends to per-frame pose, not this mean-pooled metric), "
+                   f"not because the encoder became more discriminative")
+    print(f"pairwise clip cosine after memorization: {verdict}")
 
 
 if __name__ == '__main__':
