@@ -281,8 +281,13 @@ class AsanDataset(Dataset):
                     decoded = np.stack([
                         cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
                         for b in jpg
-                    ], axis=0)  # (T_src, 112, 112, 3) uint8, BGR (fine -- HandBackbone
-                                # is trained from scratch on this exact channel order)
+                    ], axis=0)  # (T_src, 112, 112, 3) uint8, RGB -- extract_asan_hand_crops.py
+                                # crops from scripts.extract_asan_rgb.read_frames' output,
+                                # which is already BGR->RGB converted; cv2.imencode/imdecode
+                                # round-trip preserves array values regardless of cv2's own
+                                # BGR labeling convention, so this stays true RGB. Matters
+                                # because models/pgf_fusion.py's HandBackbone is ImageNet-
+                                # pretrained and expects standard RGB + ImageNet norm stats.
                     per_hand_crops[side] = resample_hand_crops(decoded, len(kps))
 
                 meta_npz = os.path.join(self._hand_meta_dir, f"{clip_id}.npz")
