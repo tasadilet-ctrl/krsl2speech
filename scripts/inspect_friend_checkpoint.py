@@ -2,10 +2,59 @@
 Reverse-engineered architecture for a colleague's best_checkpoint.pth
 (shared out-of-band, downloaded to ~/Downloads/best_checkpoint.pth).
 
-No training code came with the checkpoint and no metrics (epoch/loss/WER)
-are stored in the file -- only the raw state_dict. Everything below was
-inferred from parameter names/shapes/dtypes alone via
-torch.load(..., weights_only=False)['model'].
+UPDATE: the colleague's approach is the Uni-Sign paper's own RGB-pose
+fusion (arXiv:2501.15187, ICLR 2025 -- the same paper this repo's pose
+encoder is already adapted from; this repo deliberately left the RGB
+branch out, per models/unisign_encoder.py's "No RGB branch (pose-only)").
+Section 3.3 ("Multi-modal Fusion") and Appendix A.3 give exact equations
+and pseudocode, confirming almost everything below with certainty instead
+of guesswork:
+
+  - RGB is HAND-ONLY, not whole-frame: videos are cropped to each hand
+    using keypoint coordinates and resized to 112x112, then encoded by
+    EfficientNet-B0 pretrained on ImageNet (paper Sec 3.2/4.1, Table:
+    "EfficientNet-B0 + GCN (5.2M + 4.5M)") -- confirms the exact backbone
+    identity found below. Face/body pose features are explicitly NOT
+    fused with RGB.
+  - Fusion happens in two attention stages per hand, per frame (paper
+    Sec 3.3, Fig 5b): (1) a standard multi-head cross-attention where
+    pose queries attend to global RGB features (matches cross_attn:
+    nn.MultiheadAttention below); (2) deformable attention (Xia et al.,
+    2022) where the keypoint COORDINATES initialize the reference points
+    and the model learns an OFFSET from that reference point to sample
+    the RGB feature map (matches to_offsets/to_q/to_k/to_v below exactly
+    -- reference point = keypoint (x,y), refined by a learned offset).
+  - Exact gating formula (paper Eq. 3-4): given pose feature F_p and the
+    attention-fused feature F_hat_p,
+        g = Gate([F_p, F_hat_p])              # concat -> gate module
+        F_final = (1 - g) * F_p + g * F_hat_p  # convex combination
+    Gate is initialized to output ZERO, so at the start of RGB-pose
+    fine-tuning F_final == F_p exactly (pure pose, matching a pose-only
+    Stage-1 checkpoint bit-for-bit) -- RGB influence is learned in
+    GRADUALLY from a safe, non-disruptive starting point. This matches
+    fusion_gate's shape below (Conv1d(512,...) taking the 256+256
+    concatenation) and explains why it's a per-frame SCALAR, not a
+    per-channel gate.
+  - Score-aware sampling (paper Appendix A.3, Algorithm 1): RGB is NOT
+    computed for every frame. A random subset of frames (size = T *
+    P_samp) is sampled with probability weighted by (1 - mean keypoint
+    confidence) -- i.e. frames with LESS reliable pose get RGB compute
+    preferentially, since that's where RGB compensates the most. This is
+    a real compute-saving detail, not just an architecture footnote: most
+    frames never touch the vision encoder at all.
+  - The paper's own training recipe is a two-stage curriculum: Stage 1
+    (pose-only pretraining) then Stage 2 (add the PGF module, gate
+    starts at zero). That's the exact same "pretrain pose alone first,
+    add RGB after" strategy this repo is independently pursuing this
+    session (train_pose_pretrain.py) -- convergent design, not a
+    coincidence to second-guess.
+
+Still not recoverable from the paper's prose+pseudocode alone (would need
+their actual code for a byte-exact reproduction): the precise attention
+head count, activation function choices, and the exact tensor shape
+bookkeeping between the 256-dim fusion space and the 768-dim pose stream
+feeding mT5. But the ALGORITHM is now confirmed, which is the part that
+actually matters for deciding whether to reproduce this approach.
 
 CONFIRMED with certainty (exact key+shape match against known classes):
   - Pose encoder ('proj_linear.*', 'gcn_modules.*', 'fusion_gcn_modules.*',
@@ -21,44 +70,39 @@ CONFIRMED with certainty (exact key+shape match against known classes):
     vs. this repo's ~2.36GB fp32 checkpoints for the same base model).
   - 'rgb_support_backbone.0.*' (358 keys) is EXACTLY
     torchvision.models.efficientnet_b0(weights=None).features, wrapped in
-    an extra nn.Sequential -- 358/358 keys and shapes match exactly. This
-    is a TRAINABLE embedded backbone (not a frozen precomputed feature
-    extractor like scripts/extract_asan_rgb.py's DINOv2 approach), and its
-    Conv2d output stays spatial (not globally pooled) -- rgb_proj is a 1x1
-    Conv2d, not a Linear, preserving a spatial feature map for the
-    attention module below to sample from.
+    an extra nn.Sequential -- 358/358 keys and shapes match exactly.
+    Confirmed by the paper too (see above): ImageNet-pretrained
+    EfficientNet-B0 on 112x112 hand crops. Conv2d output stays spatial
+    (not globally pooled) -- rgb_proj is a 1x1 Conv2d, not a Linear,
+    preserving a spatial feature map for the deformable attention module
+    to sample from (consistent with reference-point-based sampling).
 
-INFERRED (structure is verifiable via state_dict shapes; exact forward()
-wiring -- activation choices, attention head count, and precisely how the
-256-dim fusion output reconciles with the 768-dim pose stream before mT5
--- is NOT recoverable from weights alone and would need the actual code):
+MECHANISM CONFIRMED BY THE PAPER (module boundaries/shapes were already
+exact matches; the paper confirms what they DO, not just their shape):
   - rgb_proj: Conv2d(1280, 256, kernel_size=1) -- projects EfficientNet-B0's
     1280-dim final feature map down to 256 channels, keeping spatial dims.
-  - fusion_pose_rgb_DA ("DA" almost certainly = Deformable Attention):
-    a custom cross-modal deformable attention letting pose (1D, T frames)
-    query into the RGB spatial feature map with LEARNED sampling offsets,
-    similar in spirit to Deformable DETR:
+  - fusion_pose_rgb_DA ("DA" = Deformable Attention, confirmed): the two-
+    stage attention described above --
+      - cross_attn: nn.MultiheadAttention(embed_dim=256) -- stage 1,
+        pose attends to global RGB.
       - to_offsets: Conv1d(32,32,groups=32) -> activation -> Conv1d(32,2)
-        predicts a 2D (x,y) sampling offset per pose frame
-      - to_q/to_k/to_v: Conv1d/Conv2d projections into a 256-dim attention
-        space (channel dim 32 on the input side -- likely a per-head or
-        reduced-dim adapter this reconstruction can't pin down exactly)
-      - pe_layer.positional_encoding_gaussian_matrix (2, 128): a random
-        Fourier positional encoding for the RGB spatial locations -- this
-        buffer name is a verbatim match to Meta's Segment Anything Model
-        (segment-anything's PositionEmbeddingRandom class), strongly
-        suggesting this module's positional encoding was adapted from SAM.
+        predicts the LEARNED OFFSET from the keypoint-coordinate
+        reference point (stage 2's deformable sampling).
+      - to_q/to_k/to_v: Conv1d/Conv2d projections into the 256-dim
+        deformable-attention space.
+      - pe_layer.positional_encoding_gaussian_matrix (2, 128): random
+        Fourier positional encoding for the RGB spatial locations (buffer
+        name is a verbatim match to Segment Anything's
+        PositionEmbeddingRandom -- Uni-Sign's deformable attention
+        implementation borrows this positional encoding scheme).
       - rel_pos_bias.mlp: a continuous relative-position bias MLP
         (2 -> 64 -> 64 -> 1), Swin-Transformer-V2-style, adding a learned
-        bias to attention scores based on relative (x, y) offset.
-      - cross_attn: an auxiliary standard nn.MultiheadAttention(embed_dim=
-        256) (in_proj_weight/in_proj_bias naming is PyTorch's own
-        MultiheadAttention parameter convention) -- possibly used
-        alongside or as an alternative path to the deformable branch above.
+        bias to attention scores based on relative (x, y) offset from the
+        reference point.
   - fusion_gate: Conv1d(512,256,1) -> activation -> Conv1d(256,1,1) ->
-    (presumably sigmoid, not a parameterized layer) -- a LEARNED, per-frame
-    SCALAR gate deciding how much the RGB branch should influence that
-    frame, from the concatenation of pose+RGB (512 = 256+256).
+    sigmoid (not a parameterized layer) -- implements Eq. 3-4 above
+    exactly: g = Gate([F_p, F_hat_p]) (512 = 256+256 concatenation),
+    F_final = (1-g)*F_p + g*F_hat_p. Initialized to output g=0.
   - fusion_pose_rgb_linear: Linear(256, 256) -- purpose (pre- or
     post-attention refinement) not recoverable from shape alone.
 
