@@ -571,7 +571,8 @@ class MT5Trainer:
                  use_enriched=False, masked_pose_ratio=0.0, overfit_n=0,
                  ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
                  grad_accum=None, encoder_lr=None,
-                 use_pgf=False, hand_crop_root=None, pgf_p_samp=0.5):
+                 use_pgf=False, hand_crop_root=None, pgf_p_samp=0.5,
+                 pretrained_pgf=None):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
         from utils.paths import apply_env_overrides
@@ -653,6 +654,36 @@ class MT5Trainer:
         if use_pgf:
             log(f"[PGF] Prior-Guided Fusion enabled, p_samp={pgf_p_samp}")
             log(f"[PGF] Hand-crop root: {hand_crop_root}")
+
+        # Option 3: seed PGF submodules from a converted colleague checkpoint
+        # (scripts/convert_friend_checkpoint.py --convert-pgf) while still
+        # using OUR OWN encoder (--pretrained-encoder above) -- unlike
+        # --resume, this loads each PGF submodule independently rather than
+        # all-or-nothing, since the converted checkpoint deliberately never
+        # has pgf_keypoint_adapter (no equivalent in the colleague's
+        # architecture -- see that script's docstring) and an all-or-nothing
+        # check would always reject it. hand_backbone/pgf_hand_fusion are
+        # the two submodules actually worth transferring (verified genuinely
+        # trained against the real checkpoint); pgf_gate is included too in
+        # case a future source checkpoint has a real one, but
+        # convert_friend_checkpoint.py already keeps our own safe init in
+        # place of an untrained source gate, so loading it here is a no-op
+        # for that specific file.
+        if use_pgf and pretrained_pgf:
+            log(f"[PGF] Loading PGF submodules from {pretrained_pgf}")
+            pgf_ckpt = torch.load(pretrained_pgf, map_location='cpu')
+            pgf_submodules = {
+                'hand_backbone': self.model.hand_backbone,
+                'pgf_hand_fusion': self.model.pgf_hand_fusion,
+                'pgf_gate': self.model.pgf_gate,
+                'pgf_keypoint_adapter': self.model.pgf_keypoint_adapter,
+            }
+            for key, module in pgf_submodules.items():
+                if key in pgf_ckpt:
+                    module.load_state_dict(pgf_ckpt[key])
+                    log(f"  {key}: loaded")
+                else:
+                    log(f"  {key}: not in checkpoint, keeping fresh init")
 
         # --- LoRA setup (optional, via peft) ---
         # MUST happen BEFORE the DDP wrap: DDP registers parameters at wrap
@@ -1462,7 +1493,20 @@ def main():
                         help='Fraction of frames per clip that get RGB '
                              'fusion each step (paper Appendix A.3 '
                              'score-aware sampling).')
+    parser.add_argument('--pretrained-pgf', default=None,
+                        help='Seed PGF submodules (hand_backbone, '
+                             'pgf_hand_fusion, pgf_gate) from a checkpoint '
+                             'produced by scripts/convert_friend_checkpoint.py '
+                             '--convert-pgf, while still using our own '
+                             '--pretrained-encoder for the pose encoder. '
+                             'Requires --use-pgf. Each submodule loads '
+                             'independently -- pgf_keypoint_adapter has no '
+                             'equivalent in a converted colleague checkpoint '
+                             'and always stays at its fresh init.')
     args = parser.parse_args()
+
+    if args.pretrained_pgf and not args.use_pgf:
+        parser.error("--pretrained-pgf requires --use-pgf")
 
     if args.use_pgf and not args.hand_crop_root:
         parser.error("--use-pgf requires --hand-crop-root")
@@ -1506,6 +1550,7 @@ def main():
         use_pgf=args.use_pgf,
         hand_crop_root=args.hand_crop_root,
         pgf_p_samp=args.pgf_p_samp,
+        pretrained_pgf=args.pretrained_pgf,
     )
 
     trainer.train(num_epochs=args.epochs, save_dir=args.save_dir)
