@@ -37,11 +37,29 @@ PROSODY_SR = 16000
 PROSODY_HOP = 160  # 10 ms → 100 Hz
 
 
+def _resolve_ffmpeg():
+    """Prefer a system ffmpeg on PATH; fall back to the static binary
+    bundled by the imageio-ffmpeg wheel (no system install / sudo needed,
+    which is the situation on Box B). Returns the executable path or 'ffmpeg'."""
+    from shutil import which
+    exe = which('ffmpeg')
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return 'ffmpeg'  # let subprocess raise a clear error if truly absent
+
+
+_FFMPEG = _resolve_ffmpeg()
+
+
 def extract_wav(mp4_path, wav_path, sr):
     """ffmpeg: mp4 → mono wav. Returns (ok, error_detail)."""
     if os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000:
         return True, None
-    cmd = ['ffmpeg', '-y', '-loglevel', 'error', '-i', mp4_path,
+    cmd = [_FFMPEG, '-y', '-loglevel', 'error', '-i', mp4_path,
            '-vn', '-ac', '1', '-ar', str(sr), wav_path]
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=120, text=True)
