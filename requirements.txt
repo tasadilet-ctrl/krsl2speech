@@ -21,6 +21,10 @@ sentencepiece>=0.2.0  # BPE tokenization for Kazakh text
 opencv-python>=4.8.0
 tqdm>=4.66.0
 
+# mT5 (Phase 1) + RGB visual backbone (scripts/extract_asan_rgb.py)
+transformers>=4.40.0
+torchvision>=0.16.0   # required by transformers' AutoImageProcessor
+
 # Training
 torchmetrics>=1.3.0
 wandb>=0.16.0        # experiment tracking (optional)
