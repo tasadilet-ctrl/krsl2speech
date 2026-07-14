@@ -122,93 +122,67 @@ import argparse
 
 import torch
 import torch.nn as nn
-import torchvision.models as tvm
 from transformers import MT5ForConditionalGeneration, MT5Config
 
 from models.unisign_encoder import KeypointEncoder
-
-
-class PositionEmbeddingRandom(nn.Module):
-    """Verbatim structure of segment-anything's random Fourier position
-    embedding (buffer name match confirms this was the source)."""
-
-    def __init__(self, num_pos_feats=128):
-        super().__init__()
-        self.register_buffer(
-            'positional_encoding_gaussian_matrix', torch.randn(2, num_pos_feats))
-
-
-class ContinuousRelPosBiasMLP(nn.Module):
-    """2 -> 64 -> 64 -> 1, Swin-V2-style continuous relative position bias."""
-
-    def __init__(self):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Sequential(nn.Linear(2, 64), nn.ReLU(inplace=True)),
-            nn.Sequential(nn.Linear(64, 64), nn.ReLU(inplace=True)),
-            nn.Linear(64, 1, bias=True),
-        )
-
-
-class DeformableCrossAttention(nn.Module):
-    """
-    Best-effort reconstruction of fusion_pose_rgb_DA. Module TYPES/SHAPES
-    are verified exact matches; how these pieces actually connect in
-    forward() (this class has none -- inspection-only) is inferred from
-    naming convention, not confirmed.
-    """
-
-    def __init__(self, embed_dim=256, adapter_dim=32, num_heads=8):
-        super().__init__()
-        self.to_offsets = nn.Sequential(
-            nn.Conv1d(adapter_dim, adapter_dim, kernel_size=1, groups=adapter_dim),
-            nn.GELU(),
-            nn.Conv1d(adapter_dim, 2, kernel_size=1, bias=False),
-        )
-        self.to_q = nn.Conv1d(adapter_dim, embed_dim, kernel_size=1, bias=False)
-        self.to_k = nn.Conv2d(adapter_dim, embed_dim, kernel_size=1, bias=False)
-        self.to_v = nn.Conv2d(adapter_dim, embed_dim, kernel_size=1, bias=False)
-        self.to_out = nn.Conv1d(embed_dim, embed_dim, kernel_size=1)
-        self.pe_layer = PositionEmbeddingRandom(num_pos_feats=embed_dim // 2)
-        self.rel_pos_bias = ContinuousRelPosBiasMLP()
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+from models.pgf_fusion import HandBackbone, DeformablePoseRGBAttention, FusionGate
 
 
 class FriendModel(nn.Module):
     """
     Inspection-only reconstruction -- NOT wired to run inference correctly
-    (no forward() attempts the actual fusion logic). Exists so the
-    checkpoint's weights can be loaded and individual submodules examined.
+    (no forward() attempts the actual fusion logic, and this class's own
+    module boundaries don't match the checkpoint's key layout exactly --
+    e.g. fusion_pose_rgb_linear is nested under fusion_pose_rgb_DA here for
+    convenience but is a SEPARATE top-level key in the real checkpoint; see
+    scripts/convert_friend_checkpoint.py's _convert_pgf for the exact
+    remapping used when this actually needs to load into a real,
+    runnable module). Exists so the checkpoint's weights can be loaded and
+    individual submodules examined.
+
+    Uses models/pgf_fusion.py's real, wired-up classes (HandBackbone,
+    DeformablePoseRGBAttention, FusionGate) rather than re-declaring
+    inspection-only stand-ins, now that the paper (arXiv:2501.15187) has
+    confirmed the actual forward-pass wiring, not just module shapes.
     """
 
     def __init__(self):
         super().__init__()
         self.encoder_module = KeypointEncoder(hidden_dim=768, input_dim=282)
 
-        eff = tvm.efficientnet_b0(weights=None)
-        self.rgb_support_backbone = nn.Sequential(eff.features)
-        self.rgb_proj = nn.Conv2d(1280, 256, kernel_size=1)
-
-        self.fusion_pose_rgb_DA = DeformableCrossAttention()
-        self.fusion_pose_rgb_linear = nn.Linear(256, 256)
-        self.fusion_gate = nn.Sequential(
-            nn.Conv1d(512, 256, kernel_size=1),
-            nn.GELU(),
-            nn.Conv1d(256, 1, kernel_size=1),
-        )
+        self.rgb_backbone = HandBackbone(out_channels=256, pretrained=False)
+        self.fusion_pose_rgb_DA = DeformablePoseRGBAttention(
+            embed_dim=256, adapter_dim=32, num_heads=8)
+        self.fusion_gate = FusionGate(embed_dim=256)
 
         mt5_cfg = MT5Config.from_pretrained('google/mt5-base')
         self.mt5_model = MT5ForConditionalGeneration(mt5_cfg)
 
     def _remap_keys(self, sd):
-        """Encoder keys need an 'encoder_module.' prefix added; everything
-        else already matches the checkpoint's naming 1:1."""
+        """
+        Encoder keys need an 'encoder_module.' prefix added. RGB backbone
+        keys (rgb_support_backbone/rgb_proj) map to rgb_backbone.*.
+        fusion_pose_rgb_DA.* keys map to this class's fusion_pose_rgb_DA
+        (models.pgf_fusion.DeformablePoseRGBAttention) directly, and the
+        checkpoint's separate fusion_pose_rgb_linear.* key is folded in as
+        fusion_pose_rgb_DA.fusion_pose_rgb_linear.* since that's where our
+        DeformablePoseRGBAttention class keeps its own copy of that layer.
+        fusion_gate.* keys need a net. prefix (FusionGate wraps its
+        Sequential in self.net). Everything else matches 1:1.
+        """
         out = {}
         for k, v in sd.items():
             if k.startswith(('proj_linear', 'gcn_modules', 'fusion_gcn_modules',
                              'pose_proj', 'part_para')):
                 out[f'encoder_module.{k}'] = v
+            elif k.startswith(('rgb_support_backbone', 'rgb_proj')):
+                out[f'rgb_backbone.{k}'] = v
+            elif k.startswith('fusion_pose_rgb_DA.'):
+                out[k] = v
+            elif k.startswith('fusion_pose_rgb_linear.'):
+                out[f'fusion_pose_rgb_DA.{k}'] = v
+            elif k.startswith('fusion_gate.'):
+                out[f'fusion_gate.net.{k[len("fusion_gate."):]}'] = v
             else:
                 out[k] = v
         return out
