@@ -48,6 +48,8 @@ from data.asan_dataset import AsanDataset
 from data.utils import ENRICHED_DIM, KEYPOINT_DIM
 from models.unisign_encoder import (
     KeypointEncoder, load_unisign_weights, build_masked_pose_decoder)
+from models.pgf_fusion import (
+    HandBackbone, DeformablePoseRGBAttention, FusionGate, score_aware_sample_indices)
 
 
 # ============================================================
@@ -236,7 +238,8 @@ class UniSignMT5(nn.Module):
     """
 
     def __init__(self, encoder, mt5_path=MT5_PATH, lang="Kazakh",
-                 masked_pose_dim=None, ctc_vocab_size=None, rgb_dim=None):
+                 masked_pose_dim=None, ctc_vocab_size=None,
+                 use_pgf=False, pgf_p_samp=0.5):
         """
         Args:
             encoder: KeypointEncoder
@@ -251,16 +254,22 @@ class UniSignMT5(nn.Module):
                 align with the transcript — the standard fix when the decoder
                 degenerates into a pure language model (fluent output, wrong
                 content) because CE alone lets it ignore the video.
-            rgb_dim: if set, build an RGB fusion path (rgb_dim → d_model
-                projection + LayerNorm, then concat-and-project with the
-                pose embedding). Pose-only diagnostics (diagnose_phase1.py)
-                found the encoder's embeddings collapse to near-identical
-                across genuinely different clips even after real training,
-                with six architecture/training-side explanations ruled out
-                by direct testing — this tests whether pose-only input was
-                discarding exactly the fine finger/facial detail RGB can
-                supply. Frame-aligned per-clip features come from
-                scripts/extract_asan_rgb.py (frozen DINOv2 backbone).
+            use_pgf: if True, build Uni-Sign's real Prior-Guided Fusion
+                (arXiv:2501.15187 Sec 3.3 + Appendix A.3 — see
+                models/pgf_fusion.py). Pose-only diagnostics
+                (diagnose_phase1.py) found the encoder's embeddings collapse
+                to near-identical across genuinely different clips even
+                after real training, with six architecture/training-side
+                explanations ruled out by direct testing — this tests
+                whether pose-only input was discarding exactly the fine
+                finger detail RGB can supply. Fusion happens INSIDE the
+                encoder (models/unisign_encoder.py's hand_fusion_fn hook,
+                at the pre-pose_proj 256-dim per-group seam), not as a
+                post-hoc concat like the earlier whole-frame placeholder —
+                see _make_pgf_hook below.
+            pgf_p_samp: fraction of frames per clip that get RGB fusion each
+                step (paper Appendix A.3 Algorithm 1's score-aware sampling;
+                the rest of that clip's frames stay pure pose that step).
         """
         super().__init__()
         self.encoder = encoder
@@ -281,21 +290,38 @@ class UniSignMT5(nn.Module):
             self.masked_pose_decoder = build_masked_pose_decoder(
                 encoder.hidden_dim, masked_pose_dim)
 
-        # RGB fusion: project to d_model with its own LayerNorm (mirrors
-        # pose_norm's role but scoped to RGB's own scale, independent of
-        # pose's), then concat with the (already pose_norm'd) pose
-        # embedding and project back to d_model. Concat-then-project (not a
-        # plain residual add) lets the model learn arbitrary interactions
-        # between the two modalities rather than being constrained to pure
-        # addition — reasonable complexity for a first validation of
-        # whether RGB helps at all, not the final production fusion.
-        self.rgb_proj = None
-        self.fusion = None
-        if rgb_dim is not None:
-            d_model = encoder.hidden_dim
-            self.rgb_proj = nn.Sequential(
-                nn.Linear(rgb_dim, d_model), nn.LayerNorm(d_model))
-            self.fusion = nn.Linear(d_model * 2, d_model)
+        # Prior-Guided Fusion (real Uni-Sign RGB branch). Operates at the
+        # paper's C=256, matching KeypointEncoder's per-group pool_feat dim
+        # BEFORE pose_proj (1024→768) -- the hook is called from inside
+        # KeypointEncoder.forward for the left/right groups only, so no
+        # 256↔768 reconciliation layer is needed here at all.
+        self.use_pgf = use_pgf
+        self.pgf_p_samp = pgf_p_samp
+        self.hand_backbone = None
+        self.pgf_hand_fusion = None
+        self.pgf_gate = None
+        self.pgf_keypoint_adapter = None
+        if use_pgf:
+            pgf_dim = 256
+            self.hand_backbone = HandBackbone(out_channels=pgf_dim, pretrained=True)
+            self.pgf_hand_fusion = DeformablePoseRGBAttention(
+                embed_dim=pgf_dim, adapter_dim=32, num_heads=8)
+            self.pgf_gate = FusionGate(embed_dim=pgf_dim)
+            # Judgment call #4 (models/pgf_fusion.py docstring): bridges
+            # pool_feat's 256-dim pose representation down to the 32-dim
+            # adapter space to_q/to_k/to_v actually consume. No
+            # corresponding checkpoint key in a colleague's shared weights
+            # -- stays randomly initialized even after --convert-pgf.
+            self.pgf_keypoint_adapter = nn.Linear(pgf_dim, 32)
+            # ImageNet normalization stats -- HandBackbone is ImageNet-
+            # pretrained (or converted from a colleague's checkpoint, also
+            # ImageNet-pretrained per the paper), and hand crops are stored
+            # as true RGB uint8 (see data/asan_dataset.py's load_hand_crops).
+            self.register_buffer(
+                '_pgf_imagenet_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer(
+                '_pgf_imagenet_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+            log(f"[PGF] Prior-Guided Fusion enabled (p_samp={pgf_p_samp})")
 
         # MT5
         self.mt5 = MT5ForConditionalGeneration.from_pretrained(mt5_path)
@@ -329,21 +355,85 @@ class UniSignMT5(nn.Module):
         return (torch.arange(t_max, device=device)[None, :]
                 < input_lengths.to(device)[:, None]).long()  # (B, T)
 
-    def _fuse_rgb(self, pose_emb, rgb):
+    def _make_pgf_hook(self, hand_crops, hand_ref, hand_valid, hand_score, input_lengths):
         """
-        pose_emb: (B, T, d_model), already pose_norm'd.
-        rgb: (B, T, rgb_dim) or None -- frame-aligned features from
-            scripts/extract_asan_rgb.py, or None if this call doesn't
-            supply RGB (e.g. --use-rgb wasn't set, so rgb_proj/fusion were
-            never built and this is a no-op).
+        Builds the per-batch closure passed as KeypointEncoder's
+        hand_fusion_fn (models/unisign_encoder.py), called once each for
+        the 'left'/'right' groups during that forward pass.
+
+        hand_crops: (B, T, 2, 112, 112, 3) uint8, hand axis [left, right]
+        hand_ref:   (B, T, 2, 2) float32, normalized [-1,1] wrist reference
+        hand_valid: (B, T, 2) bool -- whether that frame's crop is trustworthy
+        hand_score: (B, T, 2) float32 -- mean keypoint confidence
+
+        Returns None if hand_crops is None (no RGB data this batch, or
+        --use-pgf wasn't set) -- KeypointEncoder.forward treats hand_fusion_fn=None
+        as pose-only, exactly as before.
         """
-        if self.rgb_proj is None or rgb is None:
-            return pose_emb
-        rgb_feat = self.rgb_proj(rgb)  # (B, T, d_model)
-        return self.fusion(torch.cat([pose_emb, rgb_feat], dim=-1))  # (B, T, d_model)
+        if not self.use_pgf or hand_crops is None:
+            return None
+
+        B, T = hand_crops.shape[:2]
+        device = hand_crops.device
+        hand_axis = {'left': 0, 'right': 1}
+
+        # Score-aware sampling (paper Appendix A.3 Algorithm 1) is done
+        # ONCE per batch, shared across both hands -- the paper samples
+        # per CLIP, not per hand-per-clip. Average left/right confidence
+        # since a single per-clip sampling decision needs one score.
+        combined_score = hand_score.mean(dim=-1)  # (B, T)
+        sampled_idx, sampled_mask = score_aware_sample_indices(
+            combined_score, input_lengths, self.pgf_p_samp)  # (B, K), (B, K)
+        K = sampled_idx.shape[1]
+        b_grid = torch.arange(B, device=device).unsqueeze(1).expand(B, K)  # (B, K)
+
+        def hook(mode, pool_feat, kps_raw, _input_lengths):
+            h = hand_axis[mode]
+            crops_bt = hand_crops[b_grid, sampled_idx, h]   # (B, K, 112, 112, 3) uint8
+            ref_bt = hand_ref[b_grid, sampled_idx, h]        # (B, K, 2)
+            valid_bt = hand_valid[b_grid, sampled_idx, h] & sampled_mask  # (B, K)
+            pose_bt = pool_feat[b_grid, sampled_idx]         # (B, K, 256)
+
+            flat_valid = valid_bt.reshape(-1)
+            if not flat_valid.any():
+                # No valid RGB samples this step for this hand (can happen
+                # if every sampled frame had an undetected hand). Still
+                # touch every PGF param with a zero-valued term so DDP's
+                # find_unused_parameters=False doesn't choke on unused
+                # parameters (same trick this file already uses for
+                # masked_pose_decoder/ctc_head above).
+                zero = (self.hand_backbone.rgb_proj.weight.sum() * 0.0
+                        + self.pgf_hand_fusion.to_out.weight.sum() * 0.0
+                        + self.pgf_gate.net[-1].weight.sum() * 0.0
+                        + self.pgf_keypoint_adapter.weight.sum() * 0.0)
+                return pool_feat + zero
+
+            b_flat = b_grid.reshape(-1)[flat_valid]
+            t_flat = sampled_idx.reshape(-1)[flat_valid]
+            crops_flat = crops_bt.reshape(-1, 112, 112, 3)[flat_valid]
+            ref_flat = ref_bt.reshape(-1, 2)[flat_valid]
+            pose_flat = pose_bt.reshape(-1, pose_bt.shape[-1])[flat_valid]  # (N, 256)
+
+            rgb_in = crops_flat.permute(0, 3, 1, 2).float() / 255.0  # (N, 3, 112, 112)
+            rgb_in = (rgb_in - self._pgf_imagenet_mean) / self._pgf_imagenet_std
+            rgb_map = self.hand_backbone(rgb_in)  # (N, 256, 4, 4)
+
+            pose_adapter = self.pgf_keypoint_adapter(pose_flat)  # (N, 32)
+            f_hat = self.pgf_hand_fusion(pose_adapter, rgb_map, ref_flat)  # (N, 256)
+            f_final, _ = self.pgf_gate(pose_flat, f_hat)  # (N, 256)
+
+            # Scatter fused features back; frames not selected here (either
+            # never sampled, or sampled but invalid) stay bit-identical to
+            # the pure-pose pool_feat this hook received as input.
+            out = pool_feat.clone()
+            out[b_flat, t_flat] = f_final
+            return out
+
+        return hook
 
     def forward(self, kps, label_ids, label_attn_mask, input_lengths=None,
-                kps_target=None, frame_mask=None, rgb=None):
+                kps_target=None, frame_mask=None,
+                hand_crops=None, hand_ref=None, hand_valid=None, hand_score=None):
         """
         Training forward pass.
 
@@ -355,8 +445,10 @@ class UniSignMT5(nn.Module):
             kps_target: (B, T, D) — clean keypoints (masked-pose aux target)
             frame_mask: (B, T, 1) or (B, T, D) — True at masked entries
                 (broadcasts over D; supports frame- and joint-level masks)
-            rgb: (B, T, rgb_dim) — frame-aligned RGB features, or None
-                (no-op unless the model was built with rgb_dim set)
+            hand_crops, hand_ref, hand_valid, hand_score: Prior-Guided
+                Fusion inputs from scripts/extract_asan_hand_crops.py via
+                the collator (all None unless the model was built with
+                use_pgf=True — see _make_pgf_hook above)
 
         Returns:
             loss: scalar CE loss
@@ -372,8 +464,12 @@ class UniSignMT5(nn.Module):
         # ever trained the small MLP head).
         # input_lengths re-zeroes pad frames before the encoder's temporal
         # conv so batch padding can't bleed into real boundary frames.
-        pose_emb = self.pose_norm(self.encoder(kps, input_lengths=input_lengths))  # (B, T, 768)
-        pose_emb = self._fuse_rgb(pose_emb, rgb)
+        # Prior-Guided Fusion happens INSIDE the encoder (hand_fusion_fn
+        # hook, called for the left/right groups at the pre-pose_proj
+        # 256-dim seam) rather than as a post-hoc concat.
+        pgf_hook = self._make_pgf_hook(hand_crops, hand_ref, hand_valid, hand_score, input_lengths)
+        pose_emb = self.pose_norm(self.encoder(
+            kps, input_lengths=input_lengths, hand_fusion_fn=pgf_hook))  # (B, T, 768)
 
         # Prefix embeds: re-embed each forward for grad correctness
         # (~10 token lookup is free, avoids backward-through-cached-graph bugs)
@@ -419,7 +515,7 @@ class UniSignMT5(nn.Module):
         return out.loss, mse_loss, ctc_log_probs
 
     def generate(self, kps, input_lengths=None, max_new_tokens=128, num_beams=4,
-                rgb=None):
+                hand_crops=None, hand_ref=None, hand_valid=None, hand_score=None):
         """
         Inference: generate text from keypoints.
 
@@ -428,15 +524,17 @@ class UniSignMT5(nn.Module):
             input_lengths: (B,) — true frame counts (optional)
             max_new_tokens: max output tokens
             num_beams: beam width
-            rgb: (B, T, rgb_dim) — frame-aligned RGB features, or None
+            hand_crops, hand_ref, hand_valid, hand_score: Prior-Guided
+                Fusion inputs, or None (see forward()/_make_pgf_hook above)
 
         Returns:
             list of decoded strings
         """
         B = kps.size(0)
 
-        pose_emb = self.pose_norm(self.encoder(kps, input_lengths=input_lengths))  # (B, T, 768)
-        pose_emb = self._fuse_rgb(pose_emb, rgb)
+        pgf_hook = self._make_pgf_hook(hand_crops, hand_ref, hand_valid, hand_score, input_lengths)
+        pose_emb = self.pose_norm(self.encoder(
+            kps, input_lengths=input_lengths, hand_fusion_fn=pgf_hook))  # (B, T, 768)
 
         prefix_embeds = self.mt5.shared(self.prefix_ids.unsqueeze(0).expand(B, -1))
         prefix_attn = self.prefix_attn.unsqueeze(0).expand(B, -1)
@@ -473,7 +571,7 @@ class MT5Trainer:
                  use_enriched=False, masked_pose_ratio=0.0, overfit_n=0,
                  ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
                  grad_accum=None, encoder_lr=None,
-                 use_rgb=False, rgb_root=None, rgb_dim=384):
+                 use_pgf=False, hand_crop_root=None, pgf_p_samp=0.5):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
         from utils.paths import apply_env_overrides
@@ -488,9 +586,9 @@ class MT5Trainer:
         self.overfit_n = overfit_n
         self.ctc_weight = ctc_weight
         self.freeze_spatial = freeze_spatial
-        self.use_rgb = use_rgb
-        self.rgb_root = rgb_root
-        self.rgb_dim = rgb_dim
+        self.use_pgf = use_pgf
+        self.hand_crop_root = hand_crop_root
+        self.pgf_p_samp = pgf_p_samp
         # Flags that determine model/optimizer structure — saved into the
         # checkpoint so --resume can verify the resuming run uses the same
         # architecture (a mismatch here breaks state_dict loads far less
@@ -499,7 +597,7 @@ class MT5Trainer:
             use_enriched=use_enriched, masked_pose_ratio=masked_pose_ratio,
             ctc_weight=ctc_weight, ctc_vocab_size=ctc_vocab_size,
             freeze_spatial=freeze_spatial, use_lora=use_lora,
-            use_rgb=use_rgb, rgb_dim=rgb_dim if use_rgb else None,
+            use_pgf=use_pgf, pgf_p_samp=pgf_p_samp if use_pgf else None,
         )
 
         # Subword-BPE vocabulary for the CTC auxiliary loss (id 0 = blank).
@@ -547,15 +645,14 @@ class MT5Trainer:
             encoder=self.encoder, lang="Kazakh",
             masked_pose_dim=input_dim if masked_pose_ratio > 0 else None,
             ctc_vocab_size=self.ctc_vocab_size if self.ctc_tokenizer else None,
-            rgb_dim=rgb_dim if use_rgb else None,
+            use_pgf=use_pgf, pgf_p_samp=pgf_p_samp,
         )
         if masked_pose_ratio > 0:
             log(f"[Masked Pose] Reconstruction decoder: {self.cfg['d_model']} → {input_dim}")
             log(f"[Masked Pose] Mask ratio: {masked_pose_ratio}")
-        if use_rgb:
-            log(f"[RGB] Fusion enabled: {rgb_dim} → {self.cfg['d_model']} "
-                f"(concat + project with pose_emb)")
-            log(f"[RGB] Feature root: {rgb_root}")
+        if use_pgf:
+            log(f"[PGF] Prior-Guided Fusion enabled, p_samp={pgf_p_samp}")
+            log(f"[PGF] Hand-crop root: {hand_crop_root}")
 
         # --- LoRA setup (optional, via peft) ---
         # MUST happen BEFORE the DDP wrap: DDP registers parameters at wrap
@@ -628,9 +725,11 @@ class MT5Trainer:
         if core.ctc_head is not None:
             param_groups.append({'params': core.ctc_head.parameters(), 'lr': base_lr})
 
-        if core.rgb_proj is not None:
-            param_groups.append({'params': core.rgb_proj.parameters(), 'lr': base_lr})
-            param_groups.append({'params': core.fusion.parameters(), 'lr': base_lr})
+        if core.hand_backbone is not None:
+            param_groups.append({'params': core.hand_backbone.parameters(), 'lr': base_lr})
+            param_groups.append({'params': core.pgf_hand_fusion.parameters(), 'lr': base_lr})
+            param_groups.append({'params': core.pgf_gate.parameters(), 'lr': base_lr})
+            param_groups.append({'params': core.pgf_keypoint_adapter.parameters(), 'lr': base_lr})
 
         self.optimizer = AdamW(param_groups, weight_decay=0.01)
 
@@ -710,8 +809,9 @@ class MT5Trainer:
 
         core = self.model.module if self.distributed else self.model
         core.encoder.load_state_dict(ckpt['encoder'])
-        # Unlike ctc_head/masked_pose_decoder/rgb_proj below, this used to be
-        # unconditional -- broke loading any checkpoint that never had a
+        # Unlike ctc_head/masked_pose_decoder below (hard-fail if missing),
+        # this used to be unconditional -- broke loading any checkpoint
+        # that never had a
         # pose_norm bridge layer at all (e.g. an externally-sourced encoder+
         # mt5 checkpoint converted from a different architecture that
         # normalizes the pose embedding some other way, or doesn't need to).
@@ -747,12 +847,25 @@ class MT5Trainer:
                                  "checkpoint has no masked-pose decoder.")
             core.masked_pose_decoder.load_state_dict(ckpt['masked_pose_decoder'])
 
-        if core.rgb_proj is not None:
-            if 'rgb_proj' not in ckpt or 'fusion' not in ckpt:
-                raise ValueError("[Resume] --use-rgb is set but the "
-                                 "checkpoint has no rgb_proj/fusion weights.")
-            core.rgb_proj.load_state_dict(ckpt['rgb_proj'])
-            core.fusion.load_state_dict(ckpt['fusion'])
+        if core.hand_backbone is not None:
+            # Soft-fail (unlike ctc_head/masked_pose_decoder above): a
+            # checkpoint converted from a colleague's weights via
+            # scripts/convert_friend_checkpoint.py WITHOUT --convert-pgf is
+            # a normal, expected resume target that simply has no PGF
+            # weights yet -- not a user error like a genuine --ctc-weight/
+            # --masked-pose-ratio mismatch would be.
+            pgf_keys = ('hand_backbone', 'pgf_hand_fusion', 'pgf_gate', 'pgf_keypoint_adapter')
+            if all(k in ckpt for k in pgf_keys):
+                core.hand_backbone.load_state_dict(ckpt['hand_backbone'])
+                core.pgf_hand_fusion.load_state_dict(ckpt['pgf_hand_fusion'])
+                core.pgf_gate.load_state_dict(ckpt['pgf_gate'])
+                core.pgf_keypoint_adapter.load_state_dict(ckpt['pgf_keypoint_adapter'])
+            else:
+                log("[Resume] WARNING: --use-pgf is set but the checkpoint "
+                    "has no PGF weights -- starting PGF modules from their "
+                    "default init (hand_backbone from ImageNet pretrain, "
+                    "everything else random). Expected if resuming from a "
+                    "checkpoint converted without --convert-pgf.")
 
         if 'optimizer' in ckpt:
             self.optimizer.load_state_dict(ckpt['optimizer'])
@@ -842,13 +955,13 @@ class MT5Trainer:
                 use_enriched=self.use_enriched,
                 skip_low_quality=asan_cfg.get('skip_low_quality', True),
                 min_hand_cov=asan_cfg.get('min_hand_cov', 0.0),
-                # RGB is only extracted for asan-dataset (khabar_kz/informburo
-                # below have no RGB support) -- a batch mixing sources would
-                # just see rgb=None for that batch (SimpleCollator only
-                # stacks it when every sample in the batch has it), not a
-                # crash, but in practice asan is ~10x the other sources so
-                # this is a non-issue.
-                load_rgb=self.use_rgb, rgb_root=self.rgb_root,
+                # Hand crops are only extracted for asan-dataset (khabar_kz/
+                # informburo below have no PGF support) -- a batch mixing
+                # sources would just see hand_crops=None for that batch
+                # (both collators only stack it when every sample in the
+                # batch has it), not a crash, but in practice asan is ~10x
+                # the other sources so this is a non-issue.
+                load_hand_crops=self.use_pgf, hand_crop_root=self.hand_crop_root,
             )
             all_train.append(AsanDataset(split='train', **asan_common))
             all_val.append(AsanDataset(split='val', **asan_common))
@@ -979,7 +1092,10 @@ class MT5Trainer:
             label_ids = batch['label_ids'].to(self.device)
             label_attn = batch['label_attn_mask'].to(self.device)
             input_lengths = batch['input_lengths'].to(self.device)
-            rgb = batch['rgb'].to(self.device) if batch.get('rgb') is not None else None
+            hand_crops = batch['hand_crops'].to(self.device) if batch.get('hand_crops') is not None else None
+            hand_ref = batch['hand_ref'].to(self.device) if batch.get('hand_ref') is not None else None
+            hand_valid = batch['hand_valid'].to(self.device) if batch.get('hand_valid') is not None else None
+            hand_score = batch['hand_score'].to(self.device) if batch.get('hand_score') is not None else None
 
             # --- Masked-pose reconstruction (multi-granularity:
             #     joint / frame / span, SignBERT+-style) ---
@@ -995,7 +1111,8 @@ class MT5Trainer:
                 input_lengths=input_lengths,
                 kps_target=kps if mask is not None else None,
                 frame_mask=mask,
-                rgb=rgb,
+                hand_crops=hand_crops, hand_ref=hand_ref,
+                hand_valid=hand_valid, hand_score=hand_score,
             )
             if mse_loss is None:
                 mse_loss = torch.tensor(0.0, device=self.device)
@@ -1098,11 +1215,16 @@ class MT5Trainer:
             label_ids = batch['label_ids'].to(self.device)
             label_attn = batch['label_attn_mask'].to(self.device)
             input_lengths = batch['input_lengths'].to(self.device)
-            rgb = batch['rgb'].to(self.device) if batch.get('rgb') is not None else None
+            hand_crops = batch['hand_crops'].to(self.device) if batch.get('hand_crops') is not None else None
+            hand_ref = batch['hand_ref'].to(self.device) if batch.get('hand_ref') is not None else None
+            hand_valid = batch['hand_valid'].to(self.device) if batch.get('hand_valid') is not None else None
+            hand_score = batch['hand_score'].to(self.device) if batch.get('hand_score') is not None else None
             texts = batch['texts']
 
             loss, _, _ = self.model(kps, label_ids, label_attn,
-                                    input_lengths=input_lengths, rgb=rgb)
+                                    input_lengths=input_lengths,
+                                    hand_crops=hand_crops, hand_ref=hand_ref,
+                                    hand_valid=hand_valid, hand_score=hand_score)
             if not torch.isfinite(loss):
                 continue
 
@@ -1112,7 +1234,9 @@ class MT5Trainer:
             if is_main() and num_batches <= max_gen_batches:
                 try:
                     core = self.model.module if self.distributed else self.model
-                    hyps = core.generate(kps, input_lengths=input_lengths, rgb=rgb)
+                    hyps = core.generate(kps, input_lengths=input_lengths,
+                                         hand_crops=hand_crops, hand_ref=hand_ref,
+                                         hand_valid=hand_valid, hand_score=hand_score)
                     all_hyps.extend(hyps)
                     all_refs.extend(texts)
                 except Exception as e:
@@ -1174,9 +1298,11 @@ class MT5Trainer:
             ckpt['mt5'] = core.mt5.state_dict()
         if core.masked_pose_decoder is not None:
             ckpt['masked_pose_decoder'] = core.masked_pose_decoder.state_dict()
-        if core.rgb_proj is not None:
-            ckpt['rgb_proj'] = core.rgb_proj.state_dict()
-            ckpt['fusion'] = core.fusion.state_dict()
+        if core.hand_backbone is not None:
+            ckpt['hand_backbone'] = core.hand_backbone.state_dict()
+            ckpt['pgf_hand_fusion'] = core.pgf_hand_fusion.state_dict()
+            ckpt['pgf_gate'] = core.pgf_gate.state_dict()
+            ckpt['pgf_keypoint_adapter'] = core.pgf_keypoint_adapter.state_dict()
         return ckpt
 
     def train(self, num_epochs=None, save_dir=None):
@@ -1322,21 +1448,24 @@ def main():
                              '--ctc-vocab-size/--freeze-spatial/--use-lora '
                              'flags the checkpoint was trained with. Overrides '
                              '--pretrained-encoder/--pretrained-unisign.')
-    parser.add_argument('--use-rgb', action='store_true',
-                        help='Fuse RGB features (scripts/extract_asan_rgb.py '
-                             'output) with the pose embedding before mT5. '
-                             'Requires --rgb-root pointing at the extraction '
-                             'output directory.')
-    parser.add_argument('--rgb-root', default=None,
-                        help='Output root of scripts/extract_asan_rgb.py '
+    parser.add_argument('--use-pgf', action='store_true',
+                        help='Enable Uni-Sign\'s real Prior-Guided Fusion '
+                             '(arXiv:2501.15187 -- hand-crop RGB via a '
+                             'trainable EfficientNet-B0 + deformable '
+                             'attention, see models/pgf_fusion.py). Requires '
+                             '--hand-crop-root pointing at '
+                             'scripts/extract_asan_hand_crops.py\'s output.')
+    parser.add_argument('--hand-crop-root', default=None,
+                        help='Output root of scripts/extract_asan_hand_crops.py '
                              '(the --out passed to that script).')
-    parser.add_argument('--rgb-dim', type=int, default=384,
-                        help='RGB feature dimension (384 for the default '
-                             'facebook/dinov2-small backbone).')
+    parser.add_argument('--pgf-p-samp', type=float, default=0.5,
+                        help='Fraction of frames per clip that get RGB '
+                             'fusion each step (paper Appendix A.3 '
+                             'score-aware sampling).')
     args = parser.parse_args()
 
-    if args.use_rgb and not args.rgb_root:
-        parser.error("--use-rgb requires --rgb-root")
+    if args.use_pgf and not args.hand_crop_root:
+        parser.error("--use-pgf requires --hand-crop-root")
 
     if args.resume and (args.pretrained_encoder or args.pretrained_unisign):
         print("[WARN] --resume overrides --pretrained-encoder/--pretrained-unisign "
@@ -1374,9 +1503,9 @@ def main():
         resume=args.resume,
         grad_accum=args.grad_accum,
         encoder_lr=args.encoder_lr,
-        use_rgb=args.use_rgb,
-        rgb_root=args.rgb_root,
-        rgb_dim=args.rgb_dim,
+        use_pgf=args.use_pgf,
+        hand_crop_root=args.hand_crop_root,
+        pgf_p_samp=args.pgf_p_samp,
     )
 
     trainer.train(num_epochs=args.epochs, save_dir=args.save_dir)
