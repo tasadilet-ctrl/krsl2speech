@@ -46,6 +46,7 @@ from data.kazsign_dataset import KazSignDataset
 from data.informburo_dataset import InformburoDataset
 from data.asan_dataset import AsanDataset
 from data.utils import ENRICHED_DIM, KEYPOINT_DIM
+from utils.metrics import compute_bleu, compute_rouge, compute_bertscore
 from models.unisign_encoder import (
     KeypointEncoder, load_unisign_weights, build_masked_pose_decoder)
 from models.pgf_fusion import (
@@ -1275,8 +1276,17 @@ class MT5Trainer:
 
         avg_loss = total_loss / max(num_batches, 1)
 
-        # Compute WER
-        wer = 0.0
+        # Translation-quality metrics over the same generated subset used
+        # for WER (utils/metrics.py) -- WER catches exact-transcription
+        # accuracy (what's been tracked all along); BLEU/ROUGE catch n-gram
+        # overlap (standard MT-quality metrics); BERTScore catches semantic
+        # similarity via embeddings, robust to paraphrasing/morphological
+        # variation that WER/BLEU/ROUGE penalize harshly for an agglutinative
+        # language like Kazakh. Each degrades independently (missing package
+        # -> that one metric stays 0.0 with a one-time warning) so a single
+        # missing pip install doesn't block the others or crash validation.
+        metrics = {'wer': 0.0, 'bleu': 0.0, 'rouge1': 0.0, 'rouge2': 0.0,
+                  'rougeL': 0.0, 'bertscore_f1': 0.0}
         if is_main() and all_refs and all_hyps:
             try:
                 import editdistance
@@ -1286,17 +1296,35 @@ class MT5Trainer:
                     hd = h.strip().split()
                     total_dist += editdistance.eval(rd, hd)
                     total_words += len(rd)
-                wer = total_dist / max(total_words, 1)
-                # Print a few examples for debugging
-                for i in range(min(3, len(all_refs))):
-                    log(f"  REF: {all_refs[i][:80]}")
-                    log(f"  HYP: {all_hyps[i][:80]}")
+                metrics['wer'] = total_dist / max(total_words, 1)
             except ImportError:
                 log("[WARN] pip install editdistance for WER")
 
-        return avg_loss, wer
+            try:
+                metrics['bleu'] = compute_bleu(all_refs, all_hyps)
+            except ImportError:
+                log("[WARN] pip install sacrebleu for BLEU")
 
-    def _build_checkpoint(self, epoch, val_loss, wer):
+            try:
+                r1, r2, rl = compute_rouge(all_refs, all_hyps)
+                metrics['rouge1'], metrics['rouge2'], metrics['rougeL'] = r1, r2, rl
+            except ImportError:
+                log("[WARN] pip install rouge_score for ROUGE")
+
+            try:
+                metrics['bertscore_f1'] = compute_bertscore(
+                    all_refs, all_hyps, device=str(self.device))
+            except ImportError:
+                log("[WARN] pip install bert_score for BERTScore")
+
+            # Print a few examples for debugging
+            for i in range(min(3, len(all_refs))):
+                log(f"  REF: {all_refs[i][:80]}")
+                log(f"  HYP: {all_hyps[i][:80]}")
+
+        return avg_loss, metrics
+
+    def _build_checkpoint(self, epoch, val_loss, metrics):
         """
         Checkpoint payload. Saves the MT5 decoder as well as the encoder —
         the encoder alone is NOT enough to reproduce the model at inference
@@ -1306,7 +1334,9 @@ class MT5Trainer:
         ckpt = {
             'encoder': core.encoder.state_dict(),
             'pose_norm': core.pose_norm.state_dict(),
-            'epoch': epoch, 'val_loss': val_loss, 'wer': wer,
+            'epoch': epoch, 'val_loss': val_loss,
+            'wer': metrics['wer'],  # top-level shortcut, kept for convenience
+            'metrics': metrics,     # full WER/BLEU/ROUGE/BERTScore dict
             'use_lora': self.use_lora,
             # Full trainer state for --resume: optimizer state (Adam
             # momentum/variance) and the optimizer-step counter the LR
@@ -1383,7 +1413,7 @@ class MT5Trainer:
                 train_loader.sampler.set_epoch(epoch)
 
             train_loss = self.train_epoch(train_loader, epoch)
-            val_loss, wer = self.validate(val_loader)
+            val_loss, metrics = self.validate(val_loader)
             # Rank 0 runs beam-search WER during validate; other ranks wait
             # here instead of timing out inside next epoch's first all-reduce.
             if self.distributed:
@@ -1394,17 +1424,21 @@ class MT5Trainer:
             lr_enc = self.optimizer.param_groups[0]['lr']
             log(f"Epoch {epoch+1}/{num_epochs} | "
                   f"Train: {train_loss:.4f} | Val: {val_loss:.4f} | "
-                  f"WER: {wer:.4f} | LR_enc: {lr_enc:.6f} | LR_mt5: {lr_mt5:.6f} | "
+                  f"WER: {metrics['wer']:.4f} | BLEU: {metrics['bleu']:.2f} | "
+                  f"ROUGE-1/2/L: {metrics['rouge1']:.3f}/{metrics['rouge2']:.3f}/"
+                  f"{metrics['rougeL']:.3f} | BERTScore: {metrics['bertscore_f1']:.4f} | "
+                  f"LR_enc: {lr_enc:.6f} | LR_mt5: {lr_mt5:.6f} | "
                   f"Time: {epoch_time:.1f}s")
 
             if is_main() and val_loss < self.best_loss:
                 self.best_loss = val_loss
-                ckpt = self._build_checkpoint(epoch, val_loss, wer)
+                ckpt = self._build_checkpoint(epoch, val_loss, metrics)
                 torch.save(ckpt, os.path.join(save_dir, 'phase1_mt5_best.pth'))
-                log(f"  Saved best (CE: {val_loss:.4f}, WER: {wer:.4f})")
+                log(f"  Saved best (CE: {val_loss:.4f}, WER: {metrics['wer']:.4f}, "
+                    f"BLEU: {metrics['bleu']:.2f}, BERTScore: {metrics['bertscore_f1']:.4f})")
 
             if is_main() and (epoch + 1) % 5 == 0:
-                ckpt = self._build_checkpoint(epoch, val_loss, wer)
+                ckpt = self._build_checkpoint(epoch, val_loss, metrics)
                 torch.save(ckpt, os.path.join(save_dir, f'phase1_mt5_epoch{epoch+1}.pth'))
 
         if self.distributed:

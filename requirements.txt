@@ -30,7 +30,11 @@ torchmetrics>=1.3.0
 wandb>=0.16.0        # experiment tracking (optional)
 
 # Evaluation
-jiwer>=3.0.0         # WER/CER
+jiwer>=3.0.0         # WER/CER (utils/metrics.py)
+editdistance>=0.6.0  # WER (train/train_encoder_mt5.py's inline computation)
+sacrebleu>=2.4.0     # BLEU
+rouge_score>=0.1.2   # ROUGE-1/2/L
+bert_score>=0.3.13   # semantic-similarity F1 (multilingual model, see utils/metrics.py)
 
 # TTS (Phase 3)
 # HiFi-GAN vocoder
