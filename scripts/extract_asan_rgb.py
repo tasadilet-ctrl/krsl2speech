@@ -126,6 +126,12 @@ def main():
     ap.add_argument('--device', default=None,
                     help='cuda/cpu; auto-detects if not set')
     ap.add_argument('--skip-low-quality', action='store_true', default=True)
+    ap.add_argument('--max-consecutive-failures', type=int, default=20,
+                    help='Abort if this many clips in a row fail -- almost '
+                         'certainly a broken GPU/backbone, not bad clips '
+                         '(ran through an entire ~49k-clip dataset on a '
+                         'wedged GPU once before this existed, silently '
+                         'burning hours for 3 successful clips).')
     args = ap.parse_args()
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -158,13 +164,33 @@ def main():
         print(f"[{split}] {len(entries)} clips -> {out}")
 
         records, errors = [], []
+        consecutive_failures = 0
         for i, entry in enumerate(entries):
             rec, err = process_clip(entry, args.root, rgb_dir,
                                     args.downsample_every, processor, model, device)
             if rec:
                 records.append(rec)
+                consecutive_failures = 0
             elif err:
                 errors.append(err)
+                consecutive_failures += 1
+                # A GPU/driver fault (e.g. a wedged CUDA context) makes every
+                # subsequent clip fail identically -- ran through an entire
+                # ~49k-clip dataset once with only 3 successes before this
+                # was added, silently burning hours on a broken GPU because
+                # process_clip's per-clip try/except absorbed every crash
+                # as just "one more failed clip" instead of surfacing it.
+                if consecutive_failures >= args.max_consecutive_failures:
+                    print(f"\n[extract_asan_rgb] ABORTING: "
+                          f"{consecutive_failures} consecutive failures -- "
+                          f"this almost certainly means the GPU/backbone is "
+                          f"broken, not that individual clips are bad. Last "
+                          f"error: {err}")
+                    manifest = os.path.join(out, f'manifest_{split}.jsonl')
+                    with open(manifest, 'w') as f:
+                        for r in records:
+                            f.write(json.dumps(r, ensure_ascii=False) + '\n')
+                    sys.exit(1)
             if (i + 1) % 100 == 0:
                 print(f"  [{split}] {i + 1}/{len(entries)} "
                       f"(ok={len(records)}, failed={len(errors)})")
