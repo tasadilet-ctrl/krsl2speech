@@ -678,7 +678,8 @@ class KeypointEncoder(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, kps_raw, scores=None, freeze_spatial=False, input_lengths=None):
+    def forward(self, kps_raw, scores=None, freeze_spatial=False, input_lengths=None,
+                hand_fusion_fn=None):
         """
         Forward pass matching Uni-Sign's pose branch.
 
@@ -697,6 +698,18 @@ class KeypointEncoder(nn.Module):
                 shorter-than-max clip. Re-zeroing at pad positions before
                 the time-mixing step keeps the boundary artifact-free; if
                 omitted, forward runs exactly as before (no masking).
+            hand_fusion_fn: optional callable
+                (mode: str, pool_feat: (B,T,256), kps_raw, input_lengths) -> (B,T,256)
+                Called only for mode in {'left', 'right'}, right after
+                mean-pooling over graph nodes and BEFORE the 4-group
+                concatenation + pose_proj. Lets a caller (e.g. UniSignMT5's
+                Prior-Guided RGB Fusion, see models/pgf_fusion.py) inject
+                hand-crop RGB fusion at the exact 256-dim seam the
+                architecture already provides per group, without this
+                class knowing anything about RGB/PGF -- default None means
+                this encoder's behavior is EXACTLY unchanged (pose-only,
+                per this file's own docstring) for every other caller
+                (train_pose_pretrain.py, scripts/diagnose_phase1.py, etc.).
 
         Returns:
             pose_emb: (B, T, 768)
@@ -768,6 +781,8 @@ class KeypointEncoder(nn.Module):
             # Mean pool over nodes
             pool_feat = gcn_feat.mean(dim=3)  # (B, 256, T)
             pool_feat = pool_feat.transpose(1, 2)  # (B, T, 256)
+            if hand_fusion_fn is not None and part in ('left', 'right'):
+                pool_feat = hand_fusion_fn(part, pool_feat, kps_raw, input_lengths)
             features.append(pool_feat)
 
         # Concatenate: 4 × (B, T, 256) → (B, T, 1024)
