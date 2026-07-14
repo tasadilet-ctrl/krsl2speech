@@ -132,6 +132,25 @@ def main():
     hand_valid = batch['hand_valid'].to(device)
     hand_score = batch['hand_score'].to(device)
 
+    # A bit-for-bit IDENTICAL pose-only vs PGF-active result (not just
+    # close) usually means _make_pgf_hook's "no valid samples this step"
+    # fallback triggered for both hands -- i.e. the extracted crops for
+    # these specific frames had too few detected hand keypoints (see
+    # scripts/extract_asan_hand_crops.py's min_hand_points), not that the
+    # gate's near-zero init washed out a real but tiny contribution. Report
+    # the actual valid fraction so that's diagnosed directly, not guessed.
+    valid_frac_per_clip = []
+    for b in range(len(samples)):
+        v = hand_valid[b, :lengths[b]]  # (T_valid, 2) bool, [left, right]
+        valid_frac_per_clip.append((v[:, 0].float().mean().item(),
+                                    v[:, 1].float().mean().item()))
+    print("hand_valid fraction per clip (left, right) -- 0.0 means the hook's "
+          "'no valid samples' fallback WILL trigger for that hand/clip:")
+    for b, (lf, rf) in enumerate(valid_frac_per_clip):
+        print(f"  clip {b}: left={lf:.3f}  right={rf:.3f}")
+    overall_valid = hand_valid[:, :, :].float().mean().item()
+    print(f"overall hand_valid fraction across the whole batch: {overall_valid:.3f}\n")
+
     model.eval()
     with torch.no_grad():
         # Pose-only: no hook, exactly what diagnose_phase1.py's section (B)
