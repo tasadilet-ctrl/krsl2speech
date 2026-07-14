@@ -22,6 +22,7 @@ import os
 import json
 import pickle
 import numpy as np
+import cv2
 import torch
 from torch.utils.data import Dataset
 
@@ -32,6 +33,8 @@ from data.utils import (
     enrich_keypoints,
     preprocess_keypoints,
     resample_prosody,
+    resample_hand_crops,
+    resample_hand_meta,
     KEYPOINT_DIM,
     ENRICHED_DIM,
 )
@@ -70,6 +73,8 @@ class AsanDataset(Dataset):
         prosody_root=None,       # output root of scripts/extract_asan_prosody.py
         load_rgb=False,          # optional second modality: per-clip RGB features
         rgb_root=None,           # output root of scripts/extract_asan_rgb.py
+        load_hand_crops=False,   # Prior-Guided Fusion: per-frame hand-crop JPEGs
+        hand_crop_root=None,     # output root of scripts/extract_asan_hand_crops.py
         name=None,
     ):
         if split not in _SPLIT_FILES:
@@ -102,6 +107,20 @@ class AsanDataset(Dataset):
             split_dir = _SPLIT_FILES[split].replace('.json', '')
             self._rgb_dir = os.path.join(
                 os.path.expanduser(rgb_root), 'rgb', split_dir)
+
+        self.load_hand_crops = load_hand_crops
+        # extract_asan_hand_crops.py writes hand_crops/{split}/{clip_id}_{left,right}.npz
+        # and hand_meta/{split}/{clip_id}.npz
+        self._hand_crops_dir = None
+        self._hand_meta_dir = None
+        if load_hand_crops:
+            if not hand_crop_root:
+                raise ValueError("load_hand_crops=True requires hand_crop_root "
+                                 "(run scripts/extract_asan_hand_crops.py first)")
+            split_dir = _SPLIT_FILES[split].replace('.json', '')
+            hcr = os.path.expanduser(hand_crop_root)
+            self._hand_crops_dir = os.path.join(hcr, 'hand_crops', split_dir)
+            self._hand_meta_dir = os.path.join(hcr, 'hand_meta', split_dir)
 
         self.clips = []
         n_filtered = 0
@@ -242,6 +261,47 @@ class AsanDataset(Dataset):
             except Exception:
                 return self._blank_sample()
 
+        # Hand crops (Prior-Guided Fusion): per-frame JPEG crops + reference
+        # points/confidence from scripts/extract_asan_hand_crops.py,
+        # nearest-neighbor resampled to keypoint length. Stacked into a
+        # single (T, 2, ...) tensor per field, hand axis order [left, right]
+        # -- matches models/unisign_encoder.py's KeypointEncoder.MODES
+        # left/right processing order, and keeps collation to a single
+        # pad-along-T operation (same convention as 'rgb' above).
+        hand_crops = hand_ref = hand_valid = hand_score = None
+        if self.load_hand_crops:
+            clip_id = entry.get('clip_id', '')
+            try:
+                per_hand_crops, per_hand_meta = {}, {}
+                for side in ('left', 'right'):
+                    crop_npz = os.path.join(self._hand_crops_dir, f"{clip_id}_{side}.npz")
+                    if not os.path.exists(crop_npz):
+                        return self._blank_sample()
+                    jpg = np.load(crop_npz, allow_pickle=True)['jpg']
+                    decoded = np.stack([
+                        cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
+                        for b in jpg
+                    ], axis=0)  # (T_src, 112, 112, 3) uint8, BGR (fine -- HandBackbone
+                                # is trained from scratch on this exact channel order)
+                    per_hand_crops[side] = resample_hand_crops(decoded, len(kps))
+
+                meta_npz = os.path.join(self._hand_meta_dir, f"{clip_id}.npz")
+                if not os.path.exists(meta_npz):
+                    return self._blank_sample()
+                meta = np.load(meta_npz)
+                for side in ('left', 'right'):
+                    ref_r, valid_r, score_r = resample_hand_meta(
+                        meta[f'{side}_ref'], meta[f'{side}_valid'],
+                        meta[f'{side}_score'], len(kps))
+                    per_hand_meta[side] = (ref_r, valid_r, score_r)
+            except Exception:
+                return self._blank_sample()
+
+            hand_crops = np.stack([per_hand_crops['left'], per_hand_crops['right']], axis=1)
+            hand_ref = np.stack([per_hand_meta['left'][0], per_hand_meta['right'][0]], axis=1)
+            hand_valid = np.stack([per_hand_meta['left'][1], per_hand_meta['right'][1]], axis=1)
+            hand_score = np.stack([per_hand_meta['left'][2], per_hand_meta['right'][2]], axis=1)
+
         text = entry['text']
         text_ids = self.tokenizer.encode(text) if self.tokenizer else None
 
@@ -251,6 +311,14 @@ class AsanDataset(Dataset):
                         if prosody is not None else None),
             'rgb': (torch.tensor(rgb, dtype=torch.float32)
                    if rgb is not None else None),
+            'hand_crops': (torch.tensor(hand_crops, dtype=torch.uint8)
+                          if hand_crops is not None else None),
+            'hand_ref': (torch.tensor(hand_ref, dtype=torch.float32)
+                        if hand_ref is not None else None),
+            'hand_valid': (torch.tensor(hand_valid, dtype=torch.bool)
+                          if hand_valid is not None else None),
+            'hand_score': (torch.tensor(hand_score, dtype=torch.float32)
+                          if hand_score is not None else None),
             'text': text,
             'text_ids': (torch.tensor(text_ids, dtype=torch.long)
                          if text_ids is not None else None),
@@ -264,6 +332,10 @@ class AsanDataset(Dataset):
             'keypoints': torch.zeros(1, dim),
             'prosody': None,
             'rgb': None,
+            'hand_crops': None,
+            'hand_ref': None,
+            'hand_valid': None,
+            'hand_score': None,
             'text': '',
             'text_ids': torch.empty(0, dtype=torch.long),
             'input_length': 0,
