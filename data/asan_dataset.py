@@ -87,15 +87,20 @@ class AsanDataset(Dataset):
         self.use_enriched = use_enriched
         self.ds_name = name or f"asan_{lang}"
         self.load_prosody = load_prosody
-        # extract_asan_prosody.py writes prosody/{train|dev|test}/{clip_id}.npy
+        # extract_asan_prosody_v3.py writes prosody/{train|dev|test}/{clip_id}.npy
+        # (RAW [F0_hz, energy_rms], per-clip -- not per-video) plus a single
+        # corpus-wide prosody_stats.json at prosody_root.
         self._prosody_dir = None
+        self._prosody_stats = None
         if load_prosody:
             if not prosody_root:
                 raise ValueError("load_prosody=True requires prosody_root "
-                                 "(run scripts/extract_asan_prosody.py first)")
+                                 "(run scripts/extract_asan_prosody_v3.py first)")
             split_dir = _SPLIT_FILES[split].replace('.json', '')
             self._prosody_dir = os.path.join(
                 os.path.expanduser(prosody_root), 'prosody', split_dir)
+            self._prosody_stats = self._load_prosody_stats(
+                os.path.expanduser(prosody_root))
 
         self.load_rgb = load_rgb
         # extract_asan_rgb.py writes rgb/{train|dev|test}/{clip_id}.npy
@@ -231,7 +236,12 @@ class AsanDataset(Dataset):
             kps = enrich_keypoints(kps, wb_raw, hl_raw, hr_raw,
                                    kps_abs=kps_abs, joint_scores=joint_scores)
 
-        # Prosody (Phase 2): 100 Hz [F0, energy] resampled to keypoint length
+        # Prosody (Phase 2): 100 Hz [F0, energy] resampled to keypoint length.
+        # extract_asan_prosody_v3.py writes RAW F0 (Hz) + RAW RMS energy --
+        # normalize with corpus stats BEFORE resampling (resampling
+        # interpolates across unvoiced zeros and would blur the f0>0 voiced
+        # mask that _normalize_prosody relies on to only standardize voiced
+        # frames).
         prosody = None
         if self.load_prosody:
             npy = os.path.join(self._prosody_dir,
@@ -239,7 +249,8 @@ class AsanDataset(Dataset):
             if not os.path.exists(npy):
                 return self._blank_sample()  # skip clips without prosody
             try:
-                prosody = resample_prosody(np.load(npy), len(kps))
+                raw = self._normalize_prosody(np.load(npy))
+                prosody = resample_prosody(raw, len(kps))
             except Exception:
                 return self._blank_sample()
 
@@ -346,6 +357,34 @@ class AsanDataset(Dataset):
             'input_length': 0,
             'clip_id': '',
         }
+
+    def _load_prosody_stats(self, prosody_root):
+        """Corpus-wide F0/energy stats written once by
+        scripts/extract_asan_prosody_v3.py alongside the per-clip .npy files."""
+        stats_path = os.path.join(prosody_root, 'prosody_stats.json')
+        if not os.path.exists(stats_path):
+            raise FileNotFoundError(
+                f"No prosody_stats.json in {prosody_root}. Run "
+                f"scripts/extract_asan_prosody_v3.py to generate it.")
+        with open(stats_path) as fh:
+            s = json.load(fh)
+        print(f"[{self.ds_name}] prosody stats: F0 {s['f0_mean']:.1f}+"
+              f"{s['f0_std']:.1f} Hz, energy {s['energy_mean']:.4f}+"
+              f"{s['energy_std']:.4f}, voiced {100*s['voiced_ratio']:.1f}%")
+        return s
+
+    def _normalize_prosody(self, raw):
+        """RAW [F0_hz, energy_rms] (T,2) -> corpus-standardized copy. Only
+        voiced frames (F0 > 0) are standardized -- unvoiced frames stay
+        exactly 0, preserving the voiced/unvoiced mask resample_prosody and
+        downstream code rely on."""
+        s = self._prosody_stats
+        out = raw.astype(np.float32).copy()
+        f0, energy = out[:, 0], out[:, 1]
+        voiced = f0 > 0
+        f0[voiced] = (f0[voiced] - s['f0_mean']) / s['f0_std']
+        out[:, 1] = (energy - s['energy_mean']) / s['energy_std']
+        return out
 
 
 class AsanCollator(PoseTextCollator):
