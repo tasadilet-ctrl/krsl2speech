@@ -112,7 +112,14 @@ training:
     batch_size: 8
     lr_generator: 1.0e-4
     lr_discriminator: 4.0e-4
-    lambda_adv: 0.1
+    # Disabled ("Option A"): an earlier 10-epoch run showed zero learning
+    # signal (Gen/Disc/Val Prosody/Val Recon all flat) with lambda_adv=0.1 --
+    # the discriminator's hinge loss sat at ~0.72 (can't distinguish real
+    # from fake), so with only 10% weight the adversarial term contributed
+    # noise, not signal, and the generator trained as if it were pure L1
+    # regression anyway. Testing whether prosody L1 + SignRec + ProMo alone
+    # can learn the mapping before spending time tuning the discriminator.
+    lambda_adv: 0.0
     lambda_recon: 1.0
     lambda_prosody: 5.0
     # SignRecGAN paper losses (Manabe et al. Eq. 4-5); set to 0 to disable.
