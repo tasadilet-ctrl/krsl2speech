@@ -13,3 +13,7 @@ ctc_bpe_*_corpus.txt
 
 # large scratch/reference dumps
 Sign2Speech_Latest.txt
+krsl2speech_latest.txt
+
+# internal working notes (HPC hostnames/usernames, not for public repo)
+CLAUDE_CODE_CONTEXT.md

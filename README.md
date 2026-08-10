@@ -32,13 +32,15 @@ Keypoint Encoder (Temporal Transformer)
 | informburo | ~1,371 clips | Additional training data |
 | Slovo (RSL) | 1,001 classes | Transfer learning (MViTv2-S → KRSL) |
 
+**Data availability:** none of the above datasets are redistributed in this repository. `khabar_kz` and `informburo` are sign-language corpora built from Kazakhstani broadcaster footage (Khabar, Qazaqstan TV / Informburo) held under restricted-access agreements at ISSAI; `kazsign-dataset` and `Slovo` are third-party research datasets with their own licenses. Only the code (dataloaders, models, training/inference scripts) is included. To reproduce, point `configs/config.yaml` (or the `ASAN_ROOT` / `ASAN_PROSODY_ROOT` env overrides in `utils/paths.py`) at your own copies of these datasets, obtained directly from their respective owners.
+
 ## Quick Start
 
 ### 0. Setup
 
 ```bash
 # On SSH server
-cd /data/home/adilet_tasbolat
+cd /data/home/<user>
 git clone <repo> krsl2speech  # or SCP from local
 cd krsl2speech
 

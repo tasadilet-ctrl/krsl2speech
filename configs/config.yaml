@@ -42,9 +42,9 @@ paths:
     downsample_every: 2   # videos are 50 fps → 25 fps for the encoder
     # Output root of scripts/extract_asan_prosody.py (per-clip wavs,
     # prosody .npy, and manifest_{split}.jsonl for phases 2-3)
-    prosody_root: "/home/adilet_tasbolat/krsl2speech/data/asan_prosody_v3"
+    prosody_root: "/home/<user>/krsl2speech/data/asan_prosody_v3"
 
-  output: "/data/home/adilet_tasbolat/krsl2speech/output"
+  output: "/data/home/<user>/krsl2speech/output"
 
   # Prosody extraction output
   prosody:

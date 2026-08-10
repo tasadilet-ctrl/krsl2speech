@@ -100,7 +100,7 @@ PYTHONPATH=. python train/train_encoder_mt5.py \
 
 ### Current recommended run (v4, subword-CTC):
 ```bash
-export ASAN_ROOT=/home/adilet_tasbolat/asan_local
+export ASAN_ROOT=/home/<user>/asan_local
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python train/train_encoder_mt5.py \
     --config configs/config.yaml \
