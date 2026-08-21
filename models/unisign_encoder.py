@@ -840,3 +840,35 @@ def build_masked_pose_decoder(d_model, output_dim):
         nn.Dropout(0.1),
         nn.Linear(512, output_dim),
     )
+
+
+def build_prosody_aux_head(d_model, prosody_dim=2):
+    """
+    Auxiliary head predicting per-frame SPEECH prosody ([F0, energy]) from
+    the sign encoder's embeddings.
+
+    This is deliberately NOT a generation head -- the predicted prosody is
+    never used to synthesize anything. It exists purely as an auxiliary
+    SUPERVISION signal on the encoder, which is the opposite of how prosody
+    is normally used in sign-to-speech work (where it's an output of the
+    pipeline, e.g. models/prosody_gan.py).
+
+    Rationale: scripts/diagnose_phase1.py found the encoder's embeddings
+    collapse to ~0.98 pairwise cosine across genuinely different clips
+    (worst in the hand groups), i.e. the encoder is not producing
+    clip-discriminative representations. Speech prosody contours DO vary
+    substantially clip-to-clip, so to predict a clip's specific F0/energy
+    contour the encoder is forced to encode the temporal sign dynamics it
+    currently discards. The aux loss therefore applies direct pressure
+    against representation collapse.
+
+    Same shape/structure as build_masked_pose_decoder above so the two
+    auxiliary objectives stay comparable in capacity -- any difference in
+    effect should come from the SIGNAL, not from one head being bigger.
+    """
+    return nn.Sequential(
+        nn.Linear(d_model, 512),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(512, prosody_dim),
+    )

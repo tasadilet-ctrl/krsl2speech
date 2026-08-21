@@ -332,7 +332,7 @@ def main():
         {'params': other_params, 'lr': args.lr},
     ])
     for step in range(args.steps):
-        loss, _, _ = model(kps, label_ids, label_attn, input_lengths=lengths)
+        loss, _, _, _ = model(kps, label_ids, label_attn, input_lengths=lengths)
         opt.zero_grad(); loss.backward()
         if step == 0:
             g_enc = sum(p.grad.abs().sum().item()

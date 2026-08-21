@@ -48,7 +48,8 @@ from data.asan_dataset import AsanDataset
 from data.utils import ENRICHED_DIM, KEYPOINT_DIM
 from utils.metrics import compute_bleu, compute_rouge, compute_bertscore
 from models.unisign_encoder import (
-    KeypointEncoder, load_unisign_weights, build_masked_pose_decoder)
+    KeypointEncoder, load_unisign_weights, build_masked_pose_decoder,
+    build_prosody_aux_head)
 from models.pgf_fusion import (
     HandBackbone, DeformablePoseRGBAttention, FusionGate, score_aware_sample_indices)
 
@@ -240,7 +241,7 @@ class UniSignMT5(nn.Module):
 
     def __init__(self, encoder, mt5_path=MT5_PATH, lang="Kazakh",
                  masked_pose_dim=None, ctc_vocab_size=None,
-                 use_pgf=False, pgf_p_samp=0.5):
+                 use_pgf=False, pgf_p_samp=0.5, prosody_aux_dim=None):
         """
         Args:
             encoder: KeypointEncoder
@@ -290,6 +291,15 @@ class UniSignMT5(nn.Module):
         if masked_pose_dim is not None:
             self.masked_pose_decoder = build_masked_pose_decoder(
                 encoder.hidden_dim, masked_pose_dim)
+
+        # Prosody-as-supervision (ablation treatment arm). Predicts per-frame
+        # speech [F0, energy] from the encoder embedding purely to pressure
+        # the encoder into clip-discriminative representations -- see
+        # build_prosody_aux_head's docstring. None => baseline arm.
+        self.prosody_aux_head = None
+        if prosody_aux_dim is not None:
+            self.prosody_aux_head = build_prosody_aux_head(
+                encoder.hidden_dim, prosody_aux_dim)
 
         # Prior-Guided Fusion (real Uni-Sign RGB branch). Operates at the
         # paper's C=256, matching KeypointEncoder's per-group pool_feat dim
@@ -434,7 +444,8 @@ class UniSignMT5(nn.Module):
 
     def forward(self, kps, label_ids, label_attn_mask, input_lengths=None,
                 kps_target=None, frame_mask=None,
-                hand_crops=None, hand_ref=None, hand_valid=None, hand_score=None):
+                hand_crops=None, hand_ref=None, hand_valid=None, hand_score=None,
+                prosody_target=None):
         """
         Training forward pass.
 
@@ -451,10 +462,16 @@ class UniSignMT5(nn.Module):
                 the collator (all None unless the model was built with
                 use_pgf=True — see _make_pgf_hook above)
 
+            prosody_target: (B, T, 2) — per-frame [F0, energy] from
+                data/asan_dataset.py's corpus-normalized prosody, used ONLY
+                as auxiliary encoder supervision (never synthesized). None
+                in the baseline arm of the ablation.
+
         Returns:
             loss: scalar CE loss
             mse_loss: masked-pose reconstruction loss (or None)
             ctc_log_probs: (T, B, V+1) log-probs for CTC (or None)
+            prosody_aux_loss: prosody-supervision loss (or None)
         """
         B = kps.size(0)
 
@@ -513,7 +530,27 @@ class UniSignMT5(nn.Module):
         if self.ctc_head is not None:
             ctc_log_probs = self.ctc_head(pose_emb).log_softmax(-1).transpose(0, 1)
 
-        return out.loss, mse_loss, ctc_log_probs
+        # Prosody-as-supervision aux loss (ablation treatment arm). Masked to
+        # valid frames so padding can't dominate; runs whenever the head
+        # exists so DDP sees its params participate every step.
+        prosody_aux_loss = None
+        if self.prosody_aux_head is not None:
+            prosody_pred = self.prosody_aux_head(pose_emb)  # (B, T, 2)
+            if prosody_target is not None:
+                T_min = min(prosody_pred.size(1), prosody_target.size(1))
+                pred = prosody_pred[:, :T_min]
+                tgt = prosody_target[:, :T_min]
+                valid = (torch.arange(T_min, device=pred.device)[None, :]
+                         < input_lengths.to(pred.device)[:, None]).unsqueeze(-1)
+                if valid.any():
+                    prosody_aux_loss = (F.mse_loss(pred, tgt, reduction='none')
+                                        * valid).sum() / (valid.sum() * pred.size(-1))
+                else:
+                    prosody_aux_loss = prosody_pred.sum() * 0.0
+            else:
+                prosody_aux_loss = prosody_pred.sum() * 0.0
+
+        return out.loss, mse_loss, ctc_log_probs, prosody_aux_loss
 
     def generate(self, kps, input_lengths=None, max_new_tokens=128, num_beams=4,
                 hand_crops=None, hand_ref=None, hand_valid=None, hand_score=None):
@@ -573,7 +610,7 @@ class MT5Trainer:
                  ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
                  grad_accum=None, encoder_lr=None,
                  use_pgf=False, hand_crop_root=None, pgf_p_samp=0.5,
-                 pretrained_pgf=None):
+                 pretrained_pgf=None, prosody_aux_weight=0.0, prosody_root=None):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
         from utils.paths import apply_env_overrides
@@ -587,6 +624,10 @@ class MT5Trainer:
         self.masked_pose_ratio = masked_pose_ratio
         self.overfit_n = overfit_n
         self.ctc_weight = ctc_weight
+        # Prosody-as-supervision ablation: 0.0 = baseline arm (head not
+        # even built), >0 = treatment arm.
+        self.prosody_aux_weight = prosody_aux_weight
+        self.prosody_root = prosody_root
         self.freeze_spatial = freeze_spatial
         self.use_pgf = use_pgf
         self.hand_crop_root = hand_crop_root
@@ -600,6 +641,7 @@ class MT5Trainer:
             ctc_weight=ctc_weight, ctc_vocab_size=ctc_vocab_size,
             freeze_spatial=freeze_spatial, use_lora=use_lora,
             use_pgf=use_pgf, pgf_p_samp=pgf_p_samp if use_pgf else None,
+            prosody_aux_weight=prosody_aux_weight,
         )
 
         # Subword-BPE vocabulary for the CTC auxiliary loss (id 0 = blank).
@@ -648,6 +690,7 @@ class MT5Trainer:
             masked_pose_dim=input_dim if masked_pose_ratio > 0 else None,
             ctc_vocab_size=self.ctc_vocab_size if self.ctc_tokenizer else None,
             use_pgf=use_pgf, pgf_p_samp=pgf_p_samp,
+            prosody_aux_dim=2 if prosody_aux_weight > 0 else None,
         )
         if masked_pose_ratio > 0:
             log(f"[Masked Pose] Reconstruction decoder: {self.cfg['d_model']} → {input_dim}")
@@ -756,6 +799,9 @@ class MT5Trainer:
 
         if core.ctc_head is not None:
             param_groups.append({'params': core.ctc_head.parameters(), 'lr': base_lr})
+
+        if core.prosody_aux_head is not None:
+            param_groups.append({'params': core.prosody_aux_head.parameters(), 'lr': base_lr})
 
         if core.hand_backbone is not None:
             param_groups.append({'params': core.hand_backbone.parameters(), 'lr': base_lr})
@@ -866,6 +912,14 @@ class MT5Trainer:
                 raise ValueError("[Resume] checkpoint has no full 'mt5' "
                                  "weights (was it saved with --use-lora?).")
             core.mt5.load_state_dict(ckpt['mt5'])
+
+        if core.prosody_aux_head is not None:
+            if 'prosody_aux_head' in ckpt:
+                core.prosody_aux_head.load_state_dict(ckpt['prosody_aux_head'])
+            else:
+                log('[Resume] NOTE: --prosody-aux-weight > 0 but checkpoint has '
+                    'no prosody head -- starting it fresh (expected when '
+                    'branching the treatment arm off a baseline checkpoint).')
 
         if core.ctc_head is not None:
             if 'ctc_head' not in ckpt:
@@ -1001,6 +1055,11 @@ class MT5Trainer:
                 # batch has it), not a crash, but in practice asan is ~10x
                 # the other sources so this is a non-issue.
                 load_hand_crops=self.use_pgf, hand_crop_root=self.hand_crop_root,
+                # Prosody only loaded for the ablation's treatment arm;
+                # baseline arm never touches it (identical data pipeline
+                # otherwise, so the arms stay comparable).
+                load_prosody=self.prosody_aux_weight > 0,
+                prosody_root=self.prosody_root,
             )
             all_train.append(AsanDataset(split='train', **asan_common))
             all_val.append(AsanDataset(split='val', **asan_common))
@@ -1109,6 +1168,7 @@ class MT5Trainer:
         total_loss = 0
         total_mse = 0
         self._ctc_running = 0.0
+        self._prosody_aux_running = 0.0
         num_batches = 0
         pending = 0  # batches accumulated since the last optimizer step
         self.optimizer.zero_grad()
@@ -1135,6 +1195,8 @@ class MT5Trainer:
             hand_ref = batch['hand_ref'].to(self.device) if batch.get('hand_ref') is not None else None
             hand_valid = batch['hand_valid'].to(self.device) if batch.get('hand_valid') is not None else None
             hand_score = batch['hand_score'].to(self.device) if batch.get('hand_score') is not None else None
+            prosody_target = (batch['prosody'].to(self.device)
+                             if batch.get('prosody') is not None else None)
 
             # --- Masked-pose reconstruction (multi-granularity:
             #     joint / frame / span, SignBERT+-style) ---
@@ -1145,18 +1207,26 @@ class MT5Trainer:
                 kps_train = torch.where(mask, torch.zeros_like(kps), kps)
 
             # Forward pass (CE + optional aux losses, single encoder pass)
-            loss, mse_loss, ctc_log_probs = self.model(
+            loss, mse_loss, ctc_log_probs, prosody_aux_loss = self.model(
                 kps_train, label_ids, label_attn,
                 input_lengths=input_lengths,
                 kps_target=kps if mask is not None else None,
                 frame_mask=mask,
                 hand_crops=hand_crops, hand_ref=hand_ref,
                 hand_valid=hand_valid, hand_score=hand_score,
+                prosody_target=prosody_target,
             )
             if mse_loss is None:
                 mse_loss = torch.tensor(0.0, device=self.device)
             else:
                 loss = loss + 0.1 * mse_loss
+
+            # Prosody-as-supervision aux loss (ablation treatment arm).
+            if prosody_aux_loss is None:
+                prosody_aux_loss = torch.tensor(0.0, device=self.device)
+            elif self.prosody_aux_weight > 0:
+                loss = loss + self.prosody_aux_weight * prosody_aux_loss
+            self._prosody_aux_running += float(prosody_aux_loss)
 
             # CTC auxiliary loss: align encoder frames to transcript chars
             if ctc_log_probs is not None and self.ctc_weight > 0:
@@ -1210,7 +1280,9 @@ class MT5Trainer:
                      f"Loss: {total_loss / num_batches:.4f}"
                      + (f" | MSE: {total_mse / num_batches:.4f}" if total_mse > 0 else "")
                      + (f" | CTC: {self._ctc_running / num_batches:.4f}"
-                        if self._ctc_running > 0 else ""))
+                        if self._ctc_running > 0 else "")
+                     + (f" | ProsAux: {self._prosody_aux_running / num_batches:.4f}"
+                        if self._prosody_aux_running > 0 else ""))
 
         # Flush a leftover partial accumulation window at epoch end
         if pending > 0:
@@ -1260,7 +1332,7 @@ class MT5Trainer:
             hand_score = batch['hand_score'].to(self.device) if batch.get('hand_score') is not None else None
             texts = batch['texts']
 
-            loss, _, _ = self.model(kps, label_ids, label_attn,
+            loss, _, _, _ = self.model(kps, label_ids, label_attn,
                                     input_lengths=input_lengths,
                                     hand_crops=hand_crops, hand_ref=hand_ref,
                                     hand_valid=hand_valid, hand_score=hand_score)
@@ -1356,6 +1428,8 @@ class MT5Trainer:
         if core.ctc_head is not None:
             ckpt['ctc_head'] = core.ctc_head.state_dict()
             ckpt['ctc_bpe_vocab_size'] = self.ctc_vocab_size
+        if core.prosody_aux_head is not None:
+            ckpt['prosody_aux_head'] = core.prosody_aux_head.state_dict()
         if self.use_lora:
             # Adapters only (small); base MT5 is reproducible from the hub.
             ckpt['mt5_lora'] = {
@@ -1534,6 +1608,14 @@ def main():
                         help='Fraction of frames per clip that get RGB '
                              'fusion each step (paper Appendix A.3 '
                              'score-aware sampling).')
+    parser.add_argument('--prosody-aux-weight', type=float, default=0.0,
+                        help='Weight for the prosody-as-supervision auxiliary '
+                             'loss (ablation). 0 = baseline arm (head not built, '
+                             'prosody not even loaded); >0 = treatment arm. '
+                             'Requires --prosody-root.')
+    parser.add_argument('--prosody-root', default=None,
+                        help='Output root of scripts/extract_asan_prosody_v3.py '
+                             '(needs prosody_stats.json for normalization).')
     parser.add_argument('--pretrained-pgf', default=None,
                         help='Seed PGF submodules (hand_backbone, '
                              'pgf_hand_fusion, pgf_gate) from a checkpoint '
@@ -1545,6 +1627,9 @@ def main():
                              'equivalent in a converted colleague checkpoint '
                              'and always stays at its fresh init.')
     args = parser.parse_args()
+
+    if args.prosody_aux_weight > 0 and not args.prosody_root:
+        parser.error('--prosody-aux-weight > 0 requires --prosody-root')
 
     if args.pretrained_pgf and not args.use_pgf:
         parser.error("--pretrained-pgf requires --use-pgf")
@@ -1592,6 +1677,8 @@ def main():
         hand_crop_root=args.hand_crop_root,
         pgf_p_samp=args.pgf_p_samp,
         pretrained_pgf=args.pretrained_pgf,
+        prosody_aux_weight=args.prosody_aux_weight,
+        prosody_root=args.prosody_root,
     )
 
     trainer.train(num_epochs=args.epochs, save_dir=args.save_dir)
