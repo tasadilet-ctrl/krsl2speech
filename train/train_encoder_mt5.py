@@ -57,6 +57,19 @@ from models.pgf_fusion import (
 # ============================================================
 # MT5 Path (from Uni-Sign config.py)
 # ============================================================
+# Checkpoint-selection metrics and their direction. Val CE is included
+# for backwards compatibility but is NOT recommended: on this task val CE
+# rises while generation quality (WER/BLEU) keeps improving, so selecting
+# on it reliably picks a WORSE model -- observed across multiple runs.
+SELECT_METRICS = {
+    'wer': 'lower',
+    'bleu': 'higher',
+    'rouge1': 'higher',
+    'rougeL': 'higher',
+    'bertscore_f1': 'higher',
+    'val_loss': 'lower',
+}
+
 MT5_PATH = "google/mt5-base"  # 388M params, d_model=768 (matches Uni-Sign encoder)
 
 
@@ -105,6 +118,19 @@ class SimpleCollator:
             for i, r in enumerate(rgb_list):
                 rgb_padded[i, :r.shape[0], :] = r
 
+        # Prosody ([F0, energy], (T,2)) for the prosody-as-supervision
+        # ablation. Same all-or-nothing convention as rgb above:
+        # AsanDataset returns a blank sample for clips missing prosody, so a
+        # partial batch shouldn't occur once extraction covers the corpus.
+        prosody_list = [b.get('prosody') for b in valid]
+        prosody_padded = None
+        if all(p is not None for p in prosody_list) and prosody_list:
+            prosody_padded = torch.zeros(len(valid), max_t,
+                                         prosody_list[0].shape[1],
+                                         dtype=torch.float32)
+            for i, p_ in enumerate(prosody_list):
+                prosody_padded[i, :p_.shape[0], :] = p_
+
         # Pad hand-crop fields for Prior-Guided Fusion (only if every
         # sample in the batch has them -- same "skip clips missing the
         # file entirely via _blank_sample()" convention as rgb above, so
@@ -144,6 +170,7 @@ class SimpleCollator:
             'label_ids': label_ids,            # (B, L_text) — -100 for pads
             'label_attn_mask': label_attn,     # (B, L_text)
             'rgb': rgb_padded,                  # (B, T, rgb_dim) or None
+            'prosody': prosody_padded,          # (B, T, 2) or None
             'hand_crops': hand_crops_padded,    # (B, T, 2, 112, 112, 3) uint8 or None
             'hand_ref': hand_ref_padded,        # (B, T, 2, 2) or None
             'hand_valid': hand_valid_padded,    # (B, T, 2) bool or None
@@ -610,7 +637,8 @@ class MT5Trainer:
                  ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
                  grad_accum=None, encoder_lr=None,
                  use_pgf=False, hand_crop_root=None, pgf_p_samp=0.5,
-                 pretrained_pgf=None, prosody_aux_weight=0.0, prosody_root=None):
+                 pretrained_pgf=None, prosody_aux_weight=0.0, prosody_root=None,
+                 select_metric='wer'):
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
         from utils.paths import apply_env_overrides
@@ -846,6 +874,12 @@ class MT5Trainer:
 
         self.max_epochs = self.train_cfg.get('max_epochs', 20)
         self.best_loss = float('inf')
+        # Best-checkpoint selection metric. Default WER (generation
+        # quality) rather than val CE -- see SELECT_METRICS.
+        self.select_metric = select_metric
+        self.best_score = (float('-inf')
+                           if SELECT_METRICS[select_metric] == 'higher'
+                           else float('inf'))
 
         # --- Resume: full trainer state (model + optimizer + step count) ---
         # Unlike --pretrained-encoder (which loads ONLY the encoder submodule
@@ -981,6 +1015,22 @@ class MT5Trainer:
         self.best_loss = ckpt.get('val_loss')
         if self.best_loss is None:
             self.best_loss = float('inf')
+        # Restore the best-so-far score only if the checkpoint was selected
+        # on the SAME metric; otherwise the numbers aren't comparable and we
+        # restart the search (a stale best would block all future saves).
+        ckpt_metric = ckpt.get('select_metric')
+        if ckpt_metric == self.select_metric and ckpt.get('best_score') is not None:
+            self.best_score = ckpt['best_score']
+            log(f"[Resume] best_score ({self.select_metric}) restored: "
+                f"{self.best_score:.4f}")
+        elif ckpt_metric is not None and ckpt_metric != self.select_metric:
+            log(f"[Resume] checkpoint was selected on '{ckpt_metric}' but this "
+                f"run uses '{self.select_metric}' -- restarting best-score "
+                f"search from scratch.")
+        else:
+            log(f"[Resume] checkpoint predates metric-based selection -- "
+                f"restarting best-score search on '{self.select_metric}'.")
+
         log(f"[Resume] checkpoint was at epoch {ckpt.get('epoch')} -> "
             f"continuing from epoch {self.start_epoch + 1}, "
             f"global_step={self.global_step}, best_loss={self.best_loss:.4f}")
@@ -1226,7 +1276,7 @@ class MT5Trainer:
                 prosody_aux_loss = torch.tensor(0.0, device=self.device)
             elif self.prosody_aux_weight > 0:
                 loss = loss + self.prosody_aux_weight * prosody_aux_loss
-            self._prosody_aux_running += float(prosody_aux_loss)
+            self._prosody_aux_running += float(prosody_aux_loss.detach())
 
             # CTC auxiliary loss: align encoder frames to transcript chars
             if ctc_log_probs is not None and self.ctc_weight > 0:
@@ -1364,9 +1414,14 @@ class MT5Trainer:
         # language like Kazakh. Each degrades independently (missing package
         # -> that one metric stays 0.0 with a one-time warning) so a single
         # missing pip install doesn't block the others or crash validation.
+        # n_gen: how many hypotheses were actually generated. Critical for
+        # checkpoint selection -- if generation fails, every metric stays at
+        # its 0.0 default, and a WER of 0.0 would otherwise look PERFECT and
+        # be saved as the best model.
         metrics = {'wer': 0.0, 'bleu': 0.0, 'rouge1': 0.0, 'rouge2': 0.0,
-                  'rougeL': 0.0, 'bertscore_f1': 0.0}
+                  'rougeL': 0.0, 'bertscore_f1': 0.0, 'n_gen': 0}
         if is_main() and all_refs and all_hyps:
+            metrics['n_gen'] = len(all_hyps)
             try:
                 import editdistance
                 total_dist, total_words = 0, 0
@@ -1424,6 +1479,8 @@ class MT5Trainer:
             'optimizer': self.optimizer.state_dict(),
             'global_step': self.global_step,
             'run_args': self._run_args,
+            'select_metric': self.select_metric,
+            'best_score': self.best_score,
         }
         if core.ctc_head is not None:
             ckpt['ctc_head'] = core.ctc_head.state_dict()
@@ -1511,12 +1568,38 @@ class MT5Trainer:
                   f"LR_enc: {lr_enc:.6f} | LR_mt5: {lr_mt5:.6f} | "
                   f"Time: {epoch_time:.1f}s")
 
-            if is_main() and val_loss < self.best_loss:
-                self.best_loss = val_loss
-                ckpt = self._build_checkpoint(epoch, val_loss, metrics)
-                torch.save(ckpt, os.path.join(save_dir, 'phase1_mt5_best.pth'))
-                log(f"  Saved best (CE: {val_loss:.4f}, WER: {metrics['wer']:.4f}, "
-                    f"BLEU: {metrics['bleu']:.2f}, BERTScore: {metrics['bertscore_f1']:.4f})")
+            # ---- Best-checkpoint selection ----
+            # Selects on --select-metric (default WER), NOT val CE. On this
+            # task val CE rises while WER/BLEU keep improving, so val-CE
+            # selection reliably saves a worse model.
+            if is_main():
+                score = (val_loss if self.select_metric == 'val_loss'
+                         else metrics.get(self.select_metric))
+                # Guard: if generation produced nothing, every metric is at its
+                # 0.0 default and a WER of 0.0 would look perfect. Never select
+                # on metrics that no generation backed (val_loss is exempt --
+                # it doesn't depend on generation).
+                gen_backed = (self.select_metric == 'val_loss'
+                              or metrics.get('n_gen', 0) > 0)
+                if score is None:
+                    log(f"  [WARN] select-metric '{self.select_metric}' missing "
+                        f"from metrics; skipping best-checkpoint update.")
+                elif not gen_backed:
+                    log(f"  [WARN] no hypotheses generated this epoch -- metrics "
+                        f"are placeholders; skipping best-checkpoint update.")
+                else:
+                    higher_better = SELECT_METRICS[self.select_metric] == 'higher'
+                    improved = (score > self.best_score if higher_better
+                                else score < self.best_score)
+                    if improved:
+                        self.best_score = score
+                        ckpt = self._build_checkpoint(epoch, val_loss, metrics)
+                        torch.save(ckpt,
+                                   os.path.join(save_dir, 'phase1_mt5_best.pth'))
+                        log(f"  Saved best by {self.select_metric}={score:.4f} "
+                            f"(CE: {val_loss:.4f}, WER: {metrics['wer']:.4f}, "
+                            f"BLEU: {metrics['bleu']:.2f}, "
+                            f"BERTScore: {metrics['bertscore_f1']:.4f})")
 
             if is_main() and (epoch + 1) % 5 == 0:
                 ckpt = self._build_checkpoint(epoch, val_loss, metrics)
@@ -1608,6 +1691,12 @@ def main():
                         help='Fraction of frames per clip that get RGB '
                              'fusion each step (paper Appendix A.3 '
                              'score-aware sampling).')
+    parser.add_argument('--select-metric', default='wer',
+                        choices=list(SELECT_METRICS.keys()),
+                        help="Metric for best-checkpoint selection "
+                             "(default: wer). NOT val_loss -- on this "
+                             "task val CE rises while WER/BLEU improve, "
+                             "so val_loss selection saves a worse model.")
     parser.add_argument('--prosody-aux-weight', type=float, default=0.0,
                         help='Weight for the prosody-as-supervision auxiliary '
                              'loss (ablation). 0 = baseline arm (head not built, '
@@ -1679,6 +1768,7 @@ def main():
         pretrained_pgf=args.pretrained_pgf,
         prosody_aux_weight=args.prosody_aux_weight,
         prosody_root=args.prosody_root,
+        select_metric=args.select_metric,
     )
 
     trainer.train(num_epochs=args.epochs, save_dir=args.save_dir)
