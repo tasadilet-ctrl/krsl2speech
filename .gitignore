@@ -17,3 +17,11 @@ krsl2speech_latest.txt
 
 # internal working notes (HPC hostnames/usernames, not for public repo)
 CLAUDE_CODE_CONTEXT.md
+
+# virtualenv living inside the repo on training boxes (5.7 GB)
+.venv/
+
+# root-level scratch: a duplicate of configs/config.yaml, and raw run logs.
+# Logs worth keeping are committed deliberately under experiments/.
+/config.yaml
+/*.log
