@@ -1,177 +1,152 @@
-# KRSL → Kazakh Speech (S2PFormer-adapted)
+# KRSL → Kazakh text
 
-Adapted from: **Sign-to-Speech Prosody Transfer via Sign Reconstruction-based GAN** (S2PFormer, arXiv:2604.10413)
+Kazakh Sign Language translation: pose keypoints in, Kazakh text out.
+
+> **Scope note.** This began as a sign-to-*speech* pipeline adapted from
+> S2PFormer — a pose encoder feeding a prosody GAN and a FastSpeech2
+> vocoder. Both later stages were dropped, and so was an RGB-fusion
+> direction. The project is now keypoints → Kazakh text only. The prosody
+> work was closed on evidence, not preference: see
+> [EXPERIMENT_prosody_supervision.md](EXPERIMENT_prosody_supervision.md) for
+> the ablation and why it was a negative result. The code for the removed
+> stages is in git history, not in the working tree.
 
 ## Architecture
 
 ```
-Sign Keypoints (.npz)
+Sign keypoints (.npz, COCO-WholeBody)
     ↓
-Keypoint Encoder (Temporal Transformer)
+Pose encoder  (temporal transformer; optional Uni-Sign init, LoRA, masked-pose aux)
     ↓
-┌─────────────────────┬──────────────────────┐
-│ Gloss Decoder (CTC) │  Prosody GAN         │
-│ → Kazakh text       │  → F0, energy, dur   │
-└─────────┬───────────┴──────────┬───────────┘
-          │                      │
-          └──────┬───────────────┘
-                 ↓
-         FastSpeech2 (Kazakh TTS)
-                 ↓
-         HiFi-GAN Vocoder
-                 ↓
-         Kazakh Speech Audio
+mT5 decoder   (optionally a colleague's Kazakh-fine-tuned checkpoint)
+    ↓
+Kazakh text
 ```
 
-## Datasets Used
+An optional CTC head (`--ctc-weight`) can be trained alongside the
+sequence-to-sequence objective.
 
-| Dataset | Clips | Role |
-|---|---|---|
-| khabar_kz | 30,891 clips | Main training (keypoints + text + audio) |
-| kazsign-dataset | 10,037 entries | Perfectly paired sign+audio for prosody GAN |
-| informburo | ~1,371 clips | Additional training data |
-| Slovo (RSL) | 1,001 classes | Transfer learning (MViTv2-S → KRSL) |
+## Where this stands
 
-**Data availability:** none of the above datasets are redistributed in this repository. `khabar_kz` and `informburo` are sign-language corpora built from Kazakhstani broadcaster footage (Khabar, Qazaqstan TV / Informburo) held under restricted-access agreements at ISSAI; `kazsign-dataset` and `Slovo` are third-party research datasets with their own licenses. Only the code (dataloaders, models, training/inference scripts) is included. To reproduce, point `configs/config.yaml` (or the `ASAN_ROOT` / `ASAN_PROSODY_ROOT` env overrides in `utils/paths.py`) at your own copies of these datasets, obtained directly from their respective owners.
+| metric | value |
+|---|---|
+| WER | 0.919 |
+| BLEU | 3.90 |
+| ROUGE-1 | 0.183 |
+| BERTScore | 0.716 |
 
-## Quick Start
+Enriched pose encoder plus a fine-tuned mT5. **These are weak in absolute
+terms** and the model's characteristic failure is fluent but content-free
+output — `scripts/diagnose_phase1.py` traced this to encoder embeddings
+collapsing to ~0.98 pairwise cosine across genuinely different clips.
 
-### 0. Setup
+Two things to know before trusting any comparison on this setup:
+
+- **Noise floor.** Run-to-run nondeterminism alone moves WER by ~0.002 and
+  BLEU by ~0.17 (measured from accidentally duplicated epoch-3 runs). A
+  single-seed gap smaller than that means nothing.
+- **Select on generation quality, not val CE.** Validation cross-entropy is
+  *anti-correlated* with WER/BLEU here — it rises while generation improves.
+  `--select-metric` defaults to `wer` for this reason (`899cf39`).
+
+## Datasets
+
+| Dataset | Role |
+|---|---|
+| asan-dataset | umbrella corpus with predefined train/dev/test splits |
+| khabar_kz | broadcaster sign footage: keypoints + text |
+| informburo | additional broadcaster clips |
+| kazsign-dataset | paired sign + audio |
+| Slovo (RSL) | transfer-learning source |
+
+**Data availability:** none of these are redistributed here. `khabar_kz` and
+`informburo` are built from Kazakhstani broadcaster footage held under
+restricted-access agreements at ISSAI; `kazsign-dataset` and `Slovo` are
+third-party datasets under their own licenses. Only code is included. Point
+`configs/config.yaml` — or the `ASAN_ROOT` / `KRSL_OUTPUT` env overrides in
+`utils/paths.py` — at your own copies.
+
+A known data problem is open: roughly a third of the training clips come from
+a source reported to be dirty, and a cleaned re-collection exists but is not
+yet accessible. See [NOTES_clean_qazaqstantv.md](NOTES_clean_qazaqstantv.md).
+Data quality plausibly dominates method tweaks at the current numbers.
+
+## Quick start
 
 ```bash
-# On SSH server
-cd /data/home/<user>
-git clone <repo> krsl2speech  # or SCP from local
-cd krsl2speech
-
-uv venv
-source .venv/bin/activate
-uv pip install torch --index-url https://download.pytorch.org/whl/cu130
-uv pip install -r requirements.txt
+pip install -r requirements.txt
+export ASAN_ROOT=/path/to/asan-dataset      # config default will not exist on your box
 ```
 
-### 1. Build Tokenizer
+### Train
 
 ```bash
-# Extract all Kazakh text from manifest
-python3 -c "
-import json
-with open('/data/shared/srp-manifest/khabar_kz/khabar_kz.jsonl') as f, \
-     open('data/kazakh_corpus.txt', 'w') as out:
-    for line in f:
-        text = json.loads(line).get('norm_text', '')
-        if text:
-            out.write(text + '\n')
-"
-
-# Build SentencePiece BPE tokenizer
-python -c "
-from sentencepiece import SentencePieceTrainer
-SentencePieceTrainer.Train(
-    input='data/kazakh_corpus.txt',
-    model_prefix='configs/kazakh_sp',
-    vocab_size=8000,
-    character_coverage=0.999,
-    model_type='bpe',
-)
-"
-```
-
-### 2. Phase 1: Encoder + Gloss Decoder
-
-```bash
-python train/train_encoder.py \
+python train/train_encoder_mt5.py \
   --config configs/config.yaml \
-  --tokenizer configs/kazakh_sp.model \
-  --epochs 50 \
-  --save-dir output/phase1
+  --use-enriched \
+  --select-metric wer \
+  --epochs 10 \
+  --save-dir output/run1
 ```
 
-### 3. Phase 2: Prosody GAN
+Useful flags: `--pretrained-unisign` (Uni-Sign init), `--use-lora`,
+`--freeze-spatial`, `--masked-pose-ratio` (masked-pose auxiliary loss),
+`--ctc-weight`, `--resume`, `--overfit-n` (sanity-check on N clips).
+
+### Evaluate
 
 ```bash
-# First extract prosody from audio (optional, done on-the-fly)
-python inference/extract_prosody.py \
-  --audio-dir /data/shared/khabar/audio/kz \
-  --output-dir data/prosody_khabar
-
-python train/train_prosody_gan.py \
-  --config configs/config.yaml \
-  --encoder-checkpoint output/phase1/phase1_best.pth \
-  --epochs 100 \
-  --save-dir output/phase2
+python scripts/evaluate_phase1.py \
+  --ckpt output/run1/best.pth --use-enriched --split test --num-beams 4
 ```
 
-### 4. Phase 3: End-to-End Fine-tuning
+### Diagnose
 
 ```bash
-python train/train_tts.py \
-  --config configs/config.yaml \
-  --phase1-checkpoint output/phase1/phase1_best.pth \
-  --phase2-checkpoint output/phase2/phase2_best.pth \
-  --epochs 30 \
-  --save-dir output/phase3
+python scripts/diagnose_phase1.py --ckpt output/run1/best.pth
 ```
 
-### 5. Inference
+Reports pairwise embedding cosine per keypoint group — the collapse
+measurement above.
 
-```bash
-# Single clip
-python inference/sign2speech.py \
-  --config configs/config.yaml \
-  --checkpoint output/phase3/phase3_epoch30.pth \
-  --keypoints /data/shared/srp-manifest/khabar_kz/keypoints/160745/khabar__160745__seg00000.npz \
-  --output output_audio
-
-# Batch (entire manifest)
-python inference/sign2speech.py \
-  --config configs/config.yaml \
-  --checkpoint output/phase3/phase3_epoch30.pth \
-  --keypoints /data/shared/srp-manifest/khabar_kz/khabar_kz.jsonl \
-  --output output_audio_batch
-```
-
-## Config
-
-Edit `configs/config.yaml` to adjust:
-- Dataset paths (for your server)
-- Model dimensions (d_model, nhead, layers)
-- Training hyperparameters (batch_size, learning_rate)
-- Vocabulary size
-
-## Project Structure
+## Project structure
 
 ```
 krsl2speech/
-├── configs/
-│   └── config.yaml              # main config
+├── configs/config.yaml          # paths, model dims, hyperparameters
 ├── data/
-│   ├── khabar_dataset.py        # khabar_kz DataLoader
-│   ├── kazsign_dataset.py       # kazsign-dataset DataLoader
-│   └── utils.py                 # keypoint loading, prosody extraction
+│   ├── asan_dataset.py          # umbrella dataset (current)
+│   ├── khabar_dataset.py        # broadcaster corpus
+│   ├── kazsign_dataset.py       # paired sign + audio
+│   ├── informburo_dataset.py
+│   ├── collators.py
+│   └── utils.py                 # keypoint loading, audio feature helpers
 ├── models/
-│   ├── keypoint_encoder.py      # Temporal Transformer
+│   ├── keypoint_encoder.py      # temporal transformer
+│   ├── unisign_encoder.py       # Uni-Sign-initialised encoder (enriched)
 │   ├── gloss_decoder.py         # CTC decoder
-│   ├── prosody_gan.py           # SignRecGAN
-│   └── fastspeech2.py           # FastSpeech2 TTS
+│   ├── pgf_fusion.py            # pose-guided fusion (RGB direction, closed)
+│   ├── ctr_gcn_encoder.py
+│   └── str_gcn.py
 ├── train/
-│   ├── train_encoder.py         # Phase 1
-│   ├── train_prosody_gan.py     # Phase 2
-│   └── train_tts.py             # Phase 3
-├── inference/
-│   ├── sign2speech.py           # end-to-end inference
-│   └── extract_prosody.py       # bulk prosody extraction
+│   ├── train_encoder_mt5.py     # main trainer
+│   ├── train_encoder_ce.py
+│   ├── train_encoder_finetune.py
+│   ├── train_encoder.py
+│   └── train_pose_pretrain.py
+├── scripts/                     # evaluation, diagnosis, extraction utilities
 ├── utils/
-│   ├── losses.py                # loss functions
-│   └── metrics.py               # WER/CER
-├── requirements.txt
-└── README.md
+│   ├── losses.py
+│   ├── metrics.py               # WER/BLEU/ROUGE
+│   └── paths.py                 # env path overrides
+└── requirements.txt
 ```
 
-## Key Papers
+## Papers
 
-- **S2PFormer**: Manabe et al., "Sign-to-Speech Prosody Transfer via Sign Reconstruction-based GAN" (2024)
-- **FastSpeech2**: Ren et al., "FastSpeech 2: Fast and High-Quality End-to-End Text to Speech" (2021)
-- **HiFi-GAN**: Jiang et al., "HiFi-GAN: Generative Adversarial Networks for Efficient and High Fidelity Speech Synthesis" (2021)
-- **MViTv2**: Tu et al., "MaxViT: Multi-Axis Vision Transformer" (2022)
-- **COCO-WholeBody**: Jiang et al., "COCO-WholeBody: Keypoint Dataset for Whole-Body Human Pose Estimation" (CVPR 2022)
+- **Uni-Sign** — unified sign-language pretraining; source of the encoder init.
+- **mT5** — Xue et al., "mT5: A Massively Multilingual Pre-trained Text-to-Text Transformer" (2021)
+- **COCO-WholeBody** — Jiang et al., CVPR 2022; the keypoint format.
+- **S2PFormer** — Manabe et al. (2024). The original basis, retained for
+  provenance; the prosody/speech stages it motivated are no longer part of
+  this project.

@@ -1,3 +1,32 @@
+# Changes
+
+## 2026-09-14 — Removed the prosody and TTS stages
+
+The project is keypoints -> Kazakh text only. Prosody was dropped on evidence
+(EXPERIMENT_prosody_supervision.md: both ablation arms within the noise
+floor), speech synthesis followed it, and the RGB/PGF direction had already
+been closed. These files were deleted from the working tree and remain in git
+history:
+
+    data/extract_prosody.py          models/fastspeech2.py
+    data/prosody_dataset.py          models/prosody_gan.py
+    data/tts_dataset.py              train/train_prosody.py
+    inference/extract_prosody.py     train/train_tts.py
+    inference/sign2speech.py         scripts/extract_asan_prosody.py
+    scripts/kazakhtts2_to_manifest.py
+    scripts/extract_asan_prosody_v3.py
+
+Nothing reachable from a live entry point imported any of them, and every
+surviving file still compiles. Deliberately kept: the prosody helpers in
+`data/utils.py` (used by the live `kazsign_dataset`), `build_prosody_aux_head`
+in `models/unisign_encoder.py` and the `--prosody-aux-weight` flag (the
+ablation arm, default 0.0 = off), and `models/pgf_fusion.py`, which is still
+imported despite the RGB direction being closed. Removing those needs surgery
+on live files rather than a file deletion, and the training data is not
+currently on the box to verify against.
+
+Everything below predates this change and describes the pipeline as it was.
+
 # Code review changes — KRSL → Kazakh Speech
 
 # Review pass 3 (2026-07-11): paper-guided improvements
