@@ -2,15 +2,27 @@
 >
 > Both arms ran 7/10 epochs from an identical checkpoint. The winner flipped
 > every epoch, metrics disagreed within the same epoch, and the between-arm
-> gaps were the same size as the within-arm noise floor (~0.002 WER /
-> ~0.17 BLEU, measured from accidentally duplicated epoch-3 runs). `ProsAux`
+> gaps were smaller than the within-arm noise floor. `ProsAux`
 > never fell below ~0.82 against a trivial baseline of ~1.0, so the proposed
 > mechanism barely engaged. Prosody, and sign-to-speech generally, are no
 > longer part of this project; it is keypoints -> Kazakh text only.
 >
-> Do not restart this without new evidence. The durable findings from it are
-> the noise floor above, and that val CE is anti-correlated with generation
-> quality here (fixed in `899cf39`).
+> **Correction to the noise floor (2026-09-14).** This was previously recorded
+> as ~0.002 WER / ~0.17 BLEU, taken from the duplicated epoch-3 runs. The
+> logs contain a second duplicated epoch, baseline epoch 4, where the same
+> configuration on the same data gave **WER 0.9097 vs 0.9260 — a spread of
+> 0.0163**, seven times larger. The floor is therefore at least ~0.016 WER,
+> not 0.002. That makes the negative result stronger, not weaker: every
+> between-arm gap in the run (largest 0.0098 WER, at epoch 2) sits *below*
+> the noise floor. It also raises the bar for any future claim on this setup.
+>
+> Do not restart this without new evidence. The durable findings are that
+> corrected floor, and that val CE is anti-correlated with generation quality
+> here (fixed in `899cf39`).
+>
+> `experiments/prosody_ablation/analyze.py` re-derives all of this from the
+> training logs, which are committed alongside it. The 28 GB of checkpoints
+> the runs produced were deleted; the logs are the evidence.
 
 # Ablation: Prosody as Encoder Supervision for Low-Resource SLT
 

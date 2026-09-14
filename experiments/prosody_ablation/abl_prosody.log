@@ -1,0 +1,315 @@
+[paths] env overrides applied: {'ASAN_ROOT': '/data/archive/asan-dataset'}
+
+[KeypointEncoder] Uni-Sign architecture (enriched input): 5,346,472 parameters
+  Input dim: 1410 (enriched)
+  Spatial STGCN: [[64,1], [128,1], [256,1]] per group
+  Temporal STGCN: [[256,3]] per group
+  Left/right hands share weights
+  Output: (B, T, 768)
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/284 [00:00<?, ?it/s]Loading weights: 100%|██████████| 284/284 [00:00<00:00, 83550.70it/s]
+[transformers] The tied weights mapping and config for this model specifies to tie shared.weight to lm_head.weight, but both are present in the checkpoints with different values, so we will NOT tie them. You should update the config with `tie_word_embeddings=False` to silence this warning.
+[MT5] Loaded google/mt5-base
+[MT5] Encoder params: 5,346,472
+[MT5] MT5 params: 582,401,280
+
+[MT5 Trainer] Differential LR training:
+  Encoder LR: 0.000050 (5,346,472 params)
+  MT5 LR:     0.000500 (582,401,280 params)
+  Warmup:     1500 steps, then cosine decay
+  Features:   enriched (offset + velocity + acc + validity)
+[Resume] Loading trainer state from output/ours_enriched_friend_mt5.pth
+[Resume] WARNING: checkpoint has no pose_norm -- starting it from default init.
+[Resume] NOTE: --prosody-aux-weight > 0 but checkpoint has no prosody head -- starting it fresh (expected when branching the treatment arm off a baseline checkpoint).
+[Resume] WARNING: checkpoint has no optimizer state (saved by an older run) — Adam momentum/variance restart at zero, and the LR schedule restarts from warmup instead of continuing mid-decay (the epoch counter still resumes correctly).
+[Resume] checkpoint was at epoch -1 -> continuing from epoch 1, global_step=0, best_loss=inf
+
+[MT5 Trainer] Encoder: 5,346,472 | MT5: 582,401,280
+[MT5 Trainer] Device: cuda:0
+[asan_kz] prosody stats: F0 179.0+65.4 Hz, energy 0.0297+0.0272, voiced 72.3%
+[asan_kz] informburo/train.json: 5245/5249 clips kept
+[asan_kz] khabar/train.json: 21502/21524 clips kept
+[asan_kz] qazaqstantv/train.json: 13493/13546 clips kept
+[asan_kz] split=train enriched Total: 40240 clips (79 filtered), downsample=2x
+[asan_kz] prosody stats: F0 179.0+65.4 Hz, energy 0.0297+0.0272, voiced 72.3%
+[asan_kz] informburo/dev.json: 1241/1241 clips kept
+[asan_kz] khabar/dev.json: 4671/4683 clips kept
+[asan_kz] qazaqstantv/dev.json: 2990/3000 clips kept
+[asan_kz] split=val enriched Total: 8902 clips (22 filtered), downsample=2x
+[Datasets] Signer-disjoint split: train=40240, val=8902
+[Scheduler] warmup capped: 1500 → 1258 (10% of 12580 total steps)
+
+============================================================
+Phase 1: Uni-Sign Encoder + MT5
+Epochs: 10 (total, including any already completed)
+============================================================
+
+  Batch 500/5030 | Loss: 3.4575 | ProsAux: 0.9166
+  Batch 1000/5030 | Loss: 3.2779 | ProsAux: 0.8977
+  Batch 1500/5030 | Loss: 3.1773 | ProsAux: 0.8885
+  Batch 2000/5030 | Loss: 3.1238 | ProsAux: 0.8848
+  Batch 2500/5030 | Loss: 3.0757 | ProsAux: 0.8667
+  Batch 3000/5030 | Loss: 3.0431 | ProsAux: 0.8623
+  Batch 3500/5030 | Loss: 3.0186 | ProsAux: 0.8600
+  Batch 4000/5030 | Loss: 2.9934 | ProsAux: 0.8558
+  Batch 4500/5030 | Loss: 2.9609 | ProsAux: 0.8490
+  Batch 5000/5030 | Loss: 2.9194 | ProsAux: 0.8484
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 13689.12it/s]
+[transformers] [1mBertModel LOAD REPORT[0m from: bert-base-multilingual-cased
+Key                                        | Status     |  | 
+-------------------------------------------+------------+--+-
+cls.seq_relationship.weight                | UNEXPECTED |  | 
+cls.predictions.transform.dense.bias       | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  | 
+cls.predictions.bias                       | UNEXPECTED |  | 
+cls.predictions.transform.dense.weight     | UNEXPECTED |  | 
+cls.seq_relationship.bias                  | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+  REF: енді мектеп мұғалімдері өзі сабақ беретін оқушыға қосымша дәріс өткені үшін ақы 
+  HYP: енді ұстаздар өздерін скринингтен өтуге немесе басқа да емделуге жіберуге міндет
+  REF: салтанатты шараға маңғыстау облысының әкімі нұрдәулет қилыбай қатысып екі жобаны
+  HYP: олардың қатарында атырау облысы әкімінің орынбасары нұрлыбек нәлібаев атындағы р
+  REF: мемлекет осы балаға өзі қаражат бөліп жатыр сол балаға сапалы білім беру бүгінгі
+  HYP: ал түркістан облыстық полиция департаменті қызметкерлердің жалақысын өтеуге тыйы
+Epoch 1/10 | Train: 2.9162 | Val: 2.7656 | WER: 0.9773 | BLEU: 0.88 | ROUGE-1/2/L: 0.075/0.015/0.069 | BERTScore: 0.6663 | LR_enc: 0.000050 | LR_mt5: 0.000500 | Time: 1394.5s
+  Saved best (CE: 2.7656, WER: 0.9773, BLEU: 0.88, BERTScore: 0.6663)
+  Batch 500/5030 | Loss: 2.1911 | ProsAux: 0.8344
+  Batch 1000/5030 | Loss: 2.1468 | ProsAux: 0.8469
+  Batch 1500/5030 | Loss: 2.1110 | ProsAux: 0.8448
+  Batch 2000/5030 | Loss: 2.0820 | ProsAux: 0.8371
+  Batch 2500/5030 | Loss: 2.0619 | ProsAux: 0.8304
+  Batch 3000/5030 | Loss: 2.0451 | ProsAux: 0.8310
+  Batch 3500/5030 | Loss: 2.0345 | ProsAux: 0.8319
+  Batch 4000/5030 | Loss: 2.0238 | ProsAux: 0.8285
+  Batch 4500/5030 | Loss: 2.0179 | ProsAux: 0.8316
+  Batch 5000/5030 | Loss: 2.0113 | ProsAux: 0.8288
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 14197.66it/s]
+[transformers] [1mBertModel LOAD REPORT[0m from: bert-base-multilingual-cased
+Key                                        | Status     |  | 
+-------------------------------------------+------------+--+-
+cls.seq_relationship.weight                | UNEXPECTED |  | 
+cls.predictions.transform.dense.bias       | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  | 
+cls.predictions.bias                       | UNEXPECTED |  | 
+cls.predictions.transform.dense.weight     | UNEXPECTED |  | 
+cls.seq_relationship.bias                  | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+  REF: енді мектеп мұғалімдері өзі сабақ беретін оқушыға қосымша дәріс өткені үшін ақы 
+  HYP: енді мектеп мұғалімдері өзінің тәрбиесін ұсына алмайды яғни педагогикалық тестіл
+  REF: салтанатты шараға маңғыстау облысының әкімі нұрдәулет қилыбай қатысып екі жобаны
+  HYP: атырау облысы әкімінің орынбасары нұрлыбек нәлібаев жобаны жүзеге асырудың маңыз
+  REF: мемлекет осы балаға өзі қаражат бөліп жатыр сол балаға сапалы білім беру бүгінгі
+  HYP: қазір сабақта физика пәнін оқып жатыр мұғалімдер өзінің сыныпта сабақтан тыс уақ
+Epoch 2/10 | Train: 2.0111 | Val: 2.5051 | WER: 0.9262 | BLEU: 2.86 | ROUGE-1/2/L: 0.149/0.046/0.137 | BERTScore: 0.7045 | LR_enc: 0.000048 | LR_mt5: 0.000485 | Time: 1397.4s
+  Saved best (CE: 2.5051, WER: 0.9262, BLEU: 2.86, BERTScore: 0.7045)
+  Batch 500/5030 | Loss: 1.7054 | ProsAux: 0.8253
+  Batch 1000/5030 | Loss: 1.7179 | ProsAux: 0.8324
+  Batch 1500/5030 | Loss: 1.7252 | ProsAux: 0.8338
+  Batch 2000/5030 | Loss: 1.7358 | ProsAux: 0.8361
+  Batch 2500/5030 | Loss: 1.7398 | ProsAux: 0.8350
+  Batch 3000/5030 | Loss: 1.7431 | ProsAux: 0.8290
+  Batch 3500/5030 | Loss: 1.7487 | ProsAux: 0.8292
+  Batch 4000/5030 | Loss: 1.7532 | ProsAux: 0.8295
+  Batch 4500/5030 | Loss: 1.7537 | ProsAux: 0.8256
+  Batch 5000/5030 | Loss: 1.7565 | ProsAux: 0.8226
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 14794.33it/s]
+[transformers] [1mBertModel LOAD REPORT[0m from: bert-base-multilingual-cased
+Key                                        | Status     |  | 
+-------------------------------------------+------------+--+-
+cls.seq_relationship.weight                | UNEXPECTED |  | 
+cls.predictions.transform.dense.bias       | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  | 
+cls.predictions.bias                       | UNEXPECTED |  | 
+cls.predictions.transform.dense.weight     | UNEXPECTED |  | 
+cls.seq_relationship.bias                  | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+  REF: енді мектеп мұғалімдері өзі сабақ беретін оқушыға қосымша дәріс өткені үшін ақы 
+  HYP: енді мектеп мұғалімдері өздерін тәрбиешілерге үйретіп басқа мамандыққа бет бұра 
+  REF: салтанатты шараға маңғыстау облысының әкімі нұрдәулет қилыбай қатысып екі жобаны
+  HYP: өңір басшысының орынбасары нұрлыбек нәлібаев өңірдің дамуына үлес қосып келе жат
+  REF: мемлекет осы балаға өзі қаражат бөліп жатыр сол балаға сапалы білім беру бүгінгі
+  HYP: мемлекет тарапынан берілетін қызмет сапасын арттыру үшін мұғалімдердің өз міндет
+Epoch 3/10 | Train: 1.7567 | Val: 2.5638 | WER: 0.9311 | BLEU: 2.95 | ROUGE-1/2/L: 0.157/0.046/0.143 | BERTScore: 0.7057 | LR_enc: 0.000044 | LR_mt5: 0.000442 | Time: 1400.3s
+  Batch 500/5030 | Loss: 1.5357 | ProsAux: 0.7978
+[paths] env overrides applied: {'ASAN_ROOT': '/data/archive/asan-dataset'}
+
+[KeypointEncoder] Uni-Sign architecture (enriched input): 5,346,472 parameters
+  Input dim: 1410 (enriched)
+  Spatial STGCN: [[64,1], [128,1], [256,1]] per group
+  Temporal STGCN: [[256,3]] per group
+  Left/right hands share weights
+  Output: (B, T, 768)
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/284 [00:00<?, ?it/s]Loading weights: 100%|██████████| 284/284 [00:00<00:00, 65651.58it/s]
+[transformers] The tied weights mapping and config for this model specifies to tie shared.weight to lm_head.weight, but both are present in the checkpoints with different values, so we will NOT tie them. You should update the config with `tie_word_embeddings=False` to silence this warning.
+[MT5] Loaded google/mt5-base
+[MT5] Encoder params: 5,346,472
+[MT5] MT5 params: 582,401,280
+
+[MT5 Trainer] Differential LR training:
+  Encoder LR: 0.000050 (5,346,472 params)
+  MT5 LR:     0.000500 (582,401,280 params)
+  Warmup:     1500 steps, then cosine decay
+  Features:   enriched (offset + velocity + acc + validity)
+[Resume] Loading trainer state from output/abl_prosody_w0.5/phase1_mt5_best.pth
+[Resume] checkpoint was at epoch 1 -> continuing from epoch 3, global_step=2516, best_loss=2.5051
+
+[MT5 Trainer] Encoder: 5,346,472 | MT5: 582,401,280
+[MT5 Trainer] Device: cuda:0
+[asan_kz] prosody stats: F0 179.0+65.4 Hz, energy 0.0297+0.0272, voiced 72.3%
+[asan_kz] informburo/train.json: 5245/5249 clips kept
+[asan_kz] khabar/train.json: 21502/21524 clips kept
+[asan_kz] qazaqstantv/train.json: 13493/13546 clips kept
+[asan_kz] split=train enriched Total: 40240 clips (79 filtered), downsample=2x
+[asan_kz] prosody stats: F0 179.0+65.4 Hz, energy 0.0297+0.0272, voiced 72.3%
+[asan_kz] informburo/dev.json: 1241/1241 clips kept
+[asan_kz] khabar/dev.json: 4671/4683 clips kept
+[asan_kz] qazaqstantv/dev.json: 2990/3000 clips kept
+[asan_kz] split=val enriched Total: 8902 clips (22 filtered), downsample=2x
+[Datasets] Signer-disjoint split: train=40240, val=8902
+[Scheduler] warmup capped: 1500 → 1258 (10% of 12580 total steps)
+
+============================================================
+Phase 1: Uni-Sign Encoder + MT5
+Resuming at epoch 3, global_step=2516
+Epochs: 10 (total, including any already completed)
+============================================================
+
+  Batch 500/5030 | Loss: 1.7121 | ProsAux: 0.8495
+  Batch 1000/5030 | Loss: 1.7150 | ProsAux: 0.8353
+  Batch 1500/5030 | Loss: 1.7188 | ProsAux: 0.8256
+  Batch 2000/5030 | Loss: 1.7227 | ProsAux: 0.8168
+  Batch 2500/5030 | Loss: 1.7342 | ProsAux: 0.8229
+  Batch 3000/5030 | Loss: 1.7406 | ProsAux: 0.8223
+  Batch 3500/5030 | Loss: 1.7458 | ProsAux: 0.8201
+  Batch 4000/5030 | Loss: 1.7507 | ProsAux: 0.8223
+  Batch 4500/5030 | Loss: 1.7545 | ProsAux: 0.8223
+  Batch 5000/5030 | Loss: 1.7583 | ProsAux: 0.8237
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 14057.07it/s]
+[transformers] [1mBertModel LOAD REPORT[0m from: bert-base-multilingual-cased
+Key                                        | Status     |  | 
+-------------------------------------------+------------+--+-
+cls.seq_relationship.weight                | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  | 
+cls.predictions.transform.dense.weight     | UNEXPECTED |  | 
+cls.predictions.transform.dense.bias       | UNEXPECTED |  | 
+cls.seq_relationship.bias                  | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  | 
+cls.predictions.bias                       | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+  REF: енді мектеп мұғалімдері өзі сабақ беретін оқушыға қосымша дәріс өткені үшін ақы 
+  HYP: енді мектеп мұғалімдері өз сабақтан тыс уақытта өзге де тапсырмаларды ала алады 
+  REF: салтанатты шараға маңғыстау облысының әкімі нұрдәулет қилыбай қатысып екі жобаны
+  HYP: аудан әкімінің орынбасары нұрлыбек нәлібаев жобаны жүзеге асырудың маңыздылығы з
+  REF: мемлекет осы балаға өзі қаражат бөліп жатыр сол балаға сапалы білім беру бүгінгі
+  HYP: қазір баланың ақыл-есі кемі 1 жастан бастап сапалы білім алу керек мұғалім өзіні
+Epoch 3/10 | Train: 1.7585 | Val: 2.5758 | WER: 0.9303 | BLEU: 3.00 | ROUGE-1/2/L: 0.152/0.046/0.139 | BERTScore: 0.7039 | LR_enc: 0.000044 | LR_mt5: 0.000442 | Time: 1391.2s
+  Batch 500/5030 | Loss: 1.5562 | ProsAux: 0.8400
+  Batch 1000/5030 | Loss: 1.5645 | ProsAux: 0.8441
+  Batch 1500/5030 | Loss: 1.5649 | ProsAux: 0.8279
+  Batch 2000/5030 | Loss: 1.5662 | ProsAux: 0.8198
+  Batch 2500/5030 | Loss: 1.5705 | ProsAux: 0.8128
+  Batch 3000/5030 | Loss: 1.5765 | ProsAux: 0.8177
+  Batch 3500/5030 | Loss: 1.5803 | ProsAux: 0.8182
+  Batch 4000/5030 | Loss: 1.5868 | ProsAux: 0.8203
+  Batch 4500/5030 | Loss: 1.5897 | ProsAux: 0.8184
+  Batch 5000/5030 | Loss: 1.5940 | ProsAux: 0.8199
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 15276.86it/s]
+[transformers] [1mBertModel LOAD REPORT[0m from: bert-base-multilingual-cased
+Key                                        | Status     |  | 
+-------------------------------------------+------------+--+-
+cls.seq_relationship.weight                | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  | 
+cls.predictions.transform.dense.weight     | UNEXPECTED |  | 
+cls.predictions.transform.dense.bias       | UNEXPECTED |  | 
+cls.seq_relationship.bias                  | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  | 
+cls.predictions.bias                       | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+  REF: енді мектеп мұғалімдері өзі сабақ беретін оқушыға қосымша дәріс өткені үшін ақы 
+  HYP: енді мектеп мұғалімдері өзінің туған-туыстарын жұмыстан шығарып тестілеуге жібер
+  REF: салтанатты шараға маңғыстау облысының әкімі нұрдәулет қилыбай қатысып екі жобаны
+  HYP: жоба маңғыстау облысы әкімінің орынбасары нұрлыбек нәлібаев атындағы қазақ ұлтты
+  REF: мемлекет осы балаға өзі қаражат бөліп жатыр сол балаға сапалы білім беру бүгінгі
+  HYP: мемлекет тарапынан ақыл-кеңес сұрайтын болсақ мұғалімнің өз еркімен жалақысы бол
+Epoch 4/10 | Train: 1.5943 | Val: 2.6143 | WER: 0.9222 | BLEU: 3.37 | ROUGE-1/2/L: 0.167/0.053/0.154 | BERTScore: 0.7100 | LR_enc: 0.000038 | LR_mt5: 0.000375 | Time: 1395.2s
+  Batch 500/5030 | Loss: 1.4004 | ProsAux: 0.8079
+  Batch 1000/5030 | Loss: 1.4116 | ProsAux: 0.8135
+  Batch 1500/5030 | Loss: 1.4235 | ProsAux: 0.8210
+  Batch 2000/5030 | Loss: 1.4289 | ProsAux: 0.8180
+  Batch 2500/5030 | Loss: 1.4316 | ProsAux: 0.8150
+  Batch 3000/5030 | Loss: 1.4372 | ProsAux: 0.8175
+  Batch 3500/5030 | Loss: 1.4426 | ProsAux: 0.8189
+  Batch 4000/5030 | Loss: 1.4462 | ProsAux: 0.8191
+  Batch 4500/5030 | Loss: 1.4497 | ProsAux: 0.8185
+  Batch 5000/5030 | Loss: 1.4519 | ProsAux: 0.8172
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 14127.97it/s]
+[transformers] [1mBertModel LOAD REPORT[0m from: bert-base-multilingual-cased
+Key                                        | Status     |  | 
+-------------------------------------------+------------+--+-
+cls.seq_relationship.weight                | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  | 
+cls.predictions.transform.dense.weight     | UNEXPECTED |  | 
+cls.predictions.transform.dense.bias       | UNEXPECTED |  | 
+cls.seq_relationship.bias                  | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  | 
+cls.predictions.bias                       | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+  REF: енді мектеп мұғалімдері өзі сабақ беретін оқушыға қосымша дәріс өткені үшін ақы 
+  HYP: енді мектеп мұғалімдері де өз сабақтан тыс уақытта кәсіби сабақ өткізе алмайды ө
+  REF: салтанатты шараға маңғыстау облысының әкімі нұрдәулет қилыбай қатысып екі жобаны
+  HYP: жоба маңғыстау облысы әкімінің орынбасары нұрлыбек нәлібаев өңірдегі екі бірдей 
+  REF: мемлекет осы балаға өзі қаражат бөліп жатыр сол балаға сапалы білім беру бүгінгі
+  HYP: білім бөлімінің ресми өкілі - оқушылардың өз міндеті емес жалақысы қажет деп сан
+Epoch 5/10 | Train: 1.4517 | Val: 2.7582 | WER: 0.9237 | BLEU: 3.25 | ROUGE-1/2/L: 0.164/0.052/0.151 | BERTScore: 0.7074 | LR_enc: 0.000029 | LR_mt5: 0.000293 | Time: 1393.5s
+  Batch 500/5030 | Loss: 1.2959 | ProsAux: 0.8088
+  Batch 1000/5030 | Loss: 1.3126 | ProsAux: 0.8234
+  Batch 1500/5030 | Loss: 1.3091 | ProsAux: 0.8073
+  Batch 2000/5030 | Loss: 1.3124 | ProsAux: 0.8120
+  Batch 2500/5030 | Loss: 1.3131 | ProsAux: 0.8068
+  Batch 3000/5030 | Loss: 1.3149 | ProsAux: 0.8091
+  Batch 3500/5030 | Loss: 1.3172 | ProsAux: 0.8069
+  Batch 4000/5030 | Loss: 1.3219 | ProsAux: 0.8094
+  Batch 4500/5030 | Loss: 1.3274 | ProsAux: 0.8162
+  Batch 5000/5030 | Loss: 1.3267 | ProsAux: 0.8127
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 16520.53it/s]
+[transformers] [1mBertModel LOAD REPORT[0m from: bert-base-multilingual-cased
+Key                                        | Status     |  | 
+-------------------------------------------+------------+--+-
+cls.seq_relationship.weight                | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.weight | UNEXPECTED |  | 
+cls.predictions.transform.dense.weight     | UNEXPECTED |  | 
+cls.predictions.transform.dense.bias       | UNEXPECTED |  | 
+cls.seq_relationship.bias                  | UNEXPECTED |  | 
+cls.predictions.transform.LayerNorm.bias   | UNEXPECTED |  | 
+cls.predictions.bias                       | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+  REF: енді мектеп мұғалімдері өзі сабақ беретін оқушыға қосымша дәріс өткені үшін ақы 
+  HYP: енді мектеп мұғалімдері өздерінің пәндік біліктілігін арттыру мүмкін емес яғни с
+  REF: салтанатты шараға маңғыстау облысының әкімі нұрдәулет қилыбай қатысып екі жобаны
+  HYP: осылайша тмд үкіметтері ұлттық құрылтай мүшелері екі бірдей жобаны жүзеге асыру 
+  REF: мемлекет осы балаға өзі қаражат бөліп жатыр сол балаға сапалы білім беру бүгінгі
+  HYP: оқушының жалақысы бар бірақ сапалы тәрбие беру үшін ұстаздар өз міндетін мүлтікс
+Epoch 6/10 | Train: 1.3269 | Val: 2.8218 | WER: 0.9138 | BLEU: 3.74 | ROUGE-1/2/L: 0.178/0.060/0.166 | BERTScore: 0.7133 | LR_enc: 0.000021 | LR_mt5: 0.000207 | Time: 1392.7s
+  Batch 500/5030 | Loss: 1.2013 | ProsAux: 0.8052
+  Batch 1000/5030 | Loss: 1.2052 | ProsAux: 0.8090
+  Batch 1500/5030 | Loss: 1.2052 | ProsAux: 0.8087
+  Batch 2000/5030 | Loss: 1.2141 | ProsAux: 0.8177
+  Batch 2500/5030 | Loss: 1.2147 | ProsAux: 0.8147
