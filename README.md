@@ -28,26 +28,53 @@ sequence-to-sequence objective.
 
 ## Where this stands
 
-| metric | value |
-|---|---|
-| WER | 0.919 |
-| BLEU | 3.90 |
-| ROUGE-1 | 0.183 |
-| BERTScore | 0.716 |
+**First valid numbers (E1, 2026-09-17).** Everything reported before this date
+was measured on 200 informburo clips with a mixed metric path and should be
+ignored — the trainer generated on the first 25 unshuffled batches, and
+because sources concatenate in list order, generation never reached khabar or
+qazaqstantv at all. The README previously headlined WER 0.919 / BLEU 3.90 on
+that basis.
 
-Enriched pose encoder plus a fine-tuned mT5. **These are weak in absolute
-terms** and the model's characteristic failure is fluent but content-free
-output — `scripts/diagnose_phase1.py` traced this to encoder embeddings
-collapsing to ~0.98 pairwise cosine across genuinely different clips.
+Scored on the canonical 453-clip common-clean subset, beam 4:
 
-Two things to know before trusting any comparison on this setup:
+| checkpoint | WER | BLEU (norm) | BLEU (raw) | chrF | content recall |
+|---|---|---|---|---|---|
+| init (`ours_enriched_friend_mt5`) | 1.042 | 0.04 | 0.03 | 13.44 | 0.008 |
+| clean_treat epoch 5 | 0.920 | 4.87 | 4.65 | 35.77 | 0.196 |
+| clean_treat best (~ep 7) | **0.898** | **5.37** | **5.13** | **36.25** | **0.207** |
+| clean_treat epoch 10 | 0.900 | 5.24 | 5.08 | 35.99 | 0.201 |
 
-- **Noise floor.** Run-to-run nondeterminism alone moves WER by ~0.002 and
-  BLEU by ~0.17 (measured from accidentally duplicated epoch-3 runs). A
-  single-seed gap smaller than that means nothing.
+Read these carefully:
+
+- The three trained rows differ by ≤0.5 chrF on 453 clips with no bootstrap
+  intervals computed. Treat them as **indistinguishable, not as a ranking**.
+- `init` scoring near-random is expected — it carries no trained `pose_norm`,
+  so it is not a usable standalone baseline.
+- These are **still exploratory**: the initializer is a colleague's mT5 that
+  predates the data recollection, so its own train/test provenance is an open
+  question.
+- `clean_treat` trained on a split sharing 523 of 746 canonical qazaqstantv
+  dev videos, which is why 147 of the 600 selection clips are excluded from
+  every row above — the comparison is kept on identical data.
+
+Absolute numbers remain weak and the characteristic failure is fluent but
+content-free output; `scripts/diagnose_phase1.py` traced this to encoder
+embeddings collapsing to ~0.98 pairwise cosine across genuinely different
+clips.
+
+**Two traps that make results on this setup easy to misread:**
+
+- **Splits leak across dataset versions.** Archive qazaqstantv train shares
+  563 video IDs with clean dev (64.2% of dev clips). Checking
+  split-disjointness *within* a single manifest does not catch this. Use
+  `ASAN_ROOT=~/asan_canonical` with its frozen selection manifest.
 - **Select on generation quality, not val CE.** Validation cross-entropy is
   *anti-correlated* with WER/BLEU here — it rises while generation improves.
   `--select-metric` defaults to `wer` for this reason (`899cf39`).
+
+Decoding is not a lever: beam 4 beats beam 1 by ~1.3 chrF consistently, but
+repetition penalty and trigram blocking move nothing (all beam-4 variants
+within 0.27 chrF).
 
 ## Datasets
 
@@ -66,17 +93,27 @@ third-party datasets under their own licenses. Only code is included. Point
 `configs/config.yaml` — or the `ASAN_ROOT` / `KRSL_OUTPUT` env overrides in
 `utils/paths.py` — at your own copies.
 
-A known data problem is open: roughly a third of the training clips come from
-a source reported to be dirty, and a cleaned re-collection exists but is not
-yet accessible. See [NOTES_clean_qazaqstantv.md](NOTES_clean_qazaqstantv.md).
-Data quality plausibly dominates method tweaks at the current numbers.
+**Data cleaning (resolved 2026-09-17).** A chunking bug in the transcription
+pass had attached wildly mismatched transcripts to short clips — in one case a
+128-word transcript on a 0.74s clip. It affected 12.9% of qazaqstantv clips,
+about 4.3% of the training corpus. (An earlier note put this at "a third of
+the training set"; that was wrong.) A re-collection is now integrated and
+verified: training clips 40,240 -> 52,835 (+31.3%), with feature distributions
+checked identical to the archive so only the intended variable changed. See
+[NOTES_clean_qazaqstantv.md](NOTES_clean_qazaqstantv.md) and
+[EXPERIMENT_clean_data.md](EXPERIMENT_clean_data.md).
 
 ## Quick start
 
 ```bash
 pip install -r requirements.txt
-export ASAN_ROOT=/path/to/asan-dataset      # config default will not exist on your box
+export ASAN_ROOT=$HOME/asan_canonical   # config default will not exist on your box
 ```
+
+All new runs should use the canonical root together with its frozen selection
+manifest (`--selection-manifest $ASAN_ROOT/selection_manifest.json`): a
+leak-free cross-version split with a 600-clip selection set, 200 per source.
+Earlier roots leak across dataset versions.
 
 ### Train
 
