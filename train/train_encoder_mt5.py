@@ -30,6 +30,7 @@ import time
 import yaml
 import argparse
 import math
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,7 +47,7 @@ from data.kazsign_dataset import KazSignDataset
 from data.informburo_dataset import InformburoDataset
 from data.asan_dataset import AsanDataset
 from data.utils import ENRICHED_DIM, KEYPOINT_DIM
-from utils.metrics import compute_bleu, compute_rouge, compute_bertscore
+from utils.metrics import compute_bleu, compute_corpus_wer, compute_rouge, compute_bertscore
 from models.unisign_encoder import (
     KeypointEncoder, load_unisign_weights, build_masked_pose_decoder,
     build_prosody_aux_head)
@@ -176,6 +177,11 @@ class SimpleCollator:
             'hand_valid': hand_valid_padded,    # (B, T, 2) bool or None
             'hand_score': hand_score_padded,    # (B, T, 2) or None
             'texts': texts,                     # raw strings for generation eval
+            # In the SAME (length-sorted) order as every tensor above. Any
+            # consumer attaching per-clip metadata must key on these, never on
+            # dataset order: this collator sorts by length and drops invalid
+            # samples, so batch position != dataset position.
+            'clip_ids': [b.get('clip_id', '') for b in valid],
         }
 
 
@@ -580,7 +586,8 @@ class UniSignMT5(nn.Module):
         return out.loss, mse_loss, ctc_log_probs, prosody_aux_loss
 
     def generate(self, kps, input_lengths=None, max_new_tokens=128, num_beams=4,
-                hand_crops=None, hand_ref=None, hand_valid=None, hand_score=None):
+                hand_crops=None, hand_ref=None, hand_valid=None, hand_score=None,
+                no_repeat_ngram_size=3, repetition_penalty=1.3):
         """
         Inference: generate text from keypoints.
 
@@ -616,9 +623,11 @@ class UniSignMT5(nn.Module):
             early_stopping=True,
             # Suppress degenerate loops ("екінші кезеңде екінші кезеңде…"):
             # they dominate early-training beams and inflate WER via
-            # insertions far past 1.0.
-            no_repeat_ngram_size=3,
-            repetition_penalty=1.3,
+            # insertions far past 1.0. Defaults preserve the historical
+            # behaviour; they are parameters so E1's dev-only decoding sweep
+            # can test whether they also suppress legitimate repetition.
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            repetition_penalty=repetition_penalty,
         )
 
         decoded = self.mt5_tokenizer.batch_decode(output_ids, skip_special_tokens=True)
@@ -633,7 +642,11 @@ class MT5Trainer:
     def __init__(self, config_path='configs/config.yaml', local_rank=0,
                  pretrained_encoder=None, pretrained_unisign=None,
                  freeze_spatial=False, use_lora=False, lora_r=16, lora_alpha=32,
-                 use_enriched=False, masked_pose_ratio=0.0, overfit_n=0,
+                 use_enriched=False, signspace=False,
+                 selection_manifest=None, block_padding_mask=False,
+                 real_wrists=False, score_quantiles=None,
+                 unisign_preprocess=False,
+                 masked_pose_ratio=0.0, overfit_n=0,
                  ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
                  grad_accum=None, encoder_lr=None,
                  use_pgf=False, hand_crop_root=None, pgf_p_samp=0.5,
@@ -649,6 +662,13 @@ class MT5Trainer:
         self.cfg = self.config['model']
         self.train_cfg = self.config['training']['phase1']
         self.use_enriched = use_enriched
+        self.signspace = signspace
+        self.real_wrists = real_wrists
+        self.score_quantiles = score_quantiles
+        self.unisign_preprocess = unisign_preprocess
+        self.selection_manifest = selection_manifest
+        self.gen_loader = None
+        self._gen_target = None
         self.masked_pose_ratio = masked_pose_ratio
         self.overfit_n = overfit_n
         self.ctc_weight = ctc_weight
@@ -665,7 +685,13 @@ class MT5Trainer:
         # architecture (a mismatch here breaks state_dict loads far less
         # clearly than this explicit check does).
         self._run_args = dict(
-            use_enriched=use_enriched, masked_pose_ratio=masked_pose_ratio,
+            use_enriched=use_enriched, signspace=signspace,
+            selection_manifest=selection_manifest,
+            block_padding_mask=block_padding_mask,
+            real_wrists=real_wrists,
+            score_quantiles=score_quantiles,
+            unisign_preprocess=unisign_preprocess,
+            masked_pose_ratio=masked_pose_ratio,
             ctc_weight=ctc_weight, ctc_vocab_size=ctc_vocab_size,
             freeze_spatial=freeze_spatial, use_lora=use_lora,
             use_pgf=use_pgf, pgf_p_samp=pgf_p_samp if use_pgf else None,
@@ -687,12 +713,19 @@ class MT5Trainer:
                 f"weight={ctc_weight}")
 
         # Determine input dimension
-        input_dim = ENRICHED_DIM() if use_enriched else KEYPOINT_DIM
+        if unisign_preprocess:
+            from data.utils import UNISIGN_DIM
+            input_dim = UNISIGN_DIM
+        else:
+            input_dim = ENRICHED_DIM() if use_enriched else KEYPOINT_DIM
 
         # Build encoder
         self.encoder = KeypointEncoder(
             hidden_dim=self.cfg['d_model'],
             input_dim=input_dim,
+            block_padding_mask=block_padding_mask,
+            real_wrists=real_wrists,
+            unisign_input=unisign_preprocess,
         )
 
         # Option 1: Load raw Uni-Sign pretrained weights
@@ -1096,6 +1129,10 @@ class MT5Trainer:
                 max_frames=self.train_cfg['max_seq_len'],
                 downsample_every=asan_cfg.get('downsample_every', 1),
                 use_enriched=self.use_enriched,
+                signspace=self.signspace,
+                real_wrists=self.real_wrists,
+                score_quantiles=self.score_quantiles,
+                unisign_preprocess=self.unisign_preprocess,
                 skip_low_quality=asan_cfg.get('skip_low_quality', True),
                 min_hand_cov=asan_cfg.get('min_hand_cov', 0.0),
                 # Hand crops are only extracted for asan-dataset (khabar_kz/
@@ -1210,6 +1247,43 @@ class MT5Trainer:
                 val_dataset, batch_size=self.train_cfg['batch_size'],
                 shuffle=False, num_workers=2, collate_fn=collator, pin_memory=True,
             )
+
+        # Frozen selection subset (E0). Without this, validate() generates on
+        # the first 25 unshuffled batches, and because sources concatenate in
+        # list order those 200 clips are 100% informburo -- 10.8% of dev, and
+        # qazaqstantv (48.6%) never generated on at all. Checkpoints were
+        # therefore selected on a sample that could not see most of the data.
+        self.gen_loader = None
+        if self.selection_manifest:
+            with open(os.path.expanduser(self.selection_manifest)) as fh:
+                wanted = {m['clip_id'] for m in json.load(fh)}
+            subsets = all_val if isinstance(val_dataset, ConcatDataset) else [val_dataset]
+            indices, offset = [], 0
+            for ds in subsets:
+                clips = getattr(ds, 'clips', [])
+                for i, c in enumerate(clips):
+                    if c.get('clip_id') in wanted:
+                        indices.append(offset + i)
+                offset += len(ds)
+            missing = len(wanted) - len(indices)
+            if missing:
+                raise RuntimeError(
+                    f"selection manifest lists {len(wanted)} clips but only "
+                    f"{len(indices)} are present in this val set ({missing} "
+                    f"missing). The manifest and ASAN_ROOT disagree -- refusing "
+                    f"to silently select on a different subset than intended.")
+            from torch.utils.data import Subset
+            self.gen_loader = DataLoader(
+                Subset(val_dataset, sorted(indices)),
+                batch_size=self.train_cfg['batch_size'], shuffle=False,
+                num_workers=2, collate_fn=collator, pin_memory=True)
+            self._gen_target = len(indices)
+            log(f"[Selection] frozen manifest: {len(indices)} clips "
+                f"({self.selection_manifest})")
+        else:
+            self._gen_target = None
+            log("[Selection] WARNING: no --selection-manifest; falling back to "
+                "the first 25 val batches, which are NOT source-representative")
 
         return train_loader, val_loader
 
@@ -1357,10 +1431,12 @@ class MT5Trainer:
     @torch.no_grad()
     def validate(self, val_loader, max_gen_batches=25):
         """
-        Validation: CE loss over the full val set; WER over the first
-        `max_gen_batches` batches (beam search over the whole set every
-        epoch dominates epoch time; val_loader is not shuffled, so this is
-        a fixed, comparable subset across epochs).
+        CE loss over the full val set; generation metrics over the frozen
+        selection subset (self.gen_loader) when one is configured.
+
+        The legacy path -- first `max_gen_batches` batches of an unshuffled
+        val_loader -- is kept only for runs without a manifest, and is NOT
+        source-representative: see create_datasets for why.
         """
         self.model.eval()
         total_loss = 0
@@ -1392,7 +1468,8 @@ class MT5Trainer:
             total_loss += loss.item()
             num_batches += 1
 
-            if is_main() and num_batches <= max_gen_batches:
+            if (is_main() and self.gen_loader is None
+                    and num_batches <= max_gen_batches):
                 try:
                     core = self.model.module if self.distributed else self.model
                     hyps = core.generate(kps, input_lengths=input_lengths,
@@ -1402,6 +1479,30 @@ class MT5Trainer:
                     all_refs.extend(texts)
                 except Exception as e:
                     log(f"  [WARN] Generation failed: {e}")
+
+        # Frozen selection subset: generate over ALL of it, and report actual
+        # coverage so a partial run can never masquerade as a full one.
+        if is_main() and self.gen_loader is not None:
+            n_failed = 0
+            core = self.model.module if self.distributed else self.model
+            for batch in self.gen_loader:
+                if batch is None:
+                    continue
+                try:
+                    hyps = core.generate(
+                        batch['keypoints'].to(self.device),
+                        input_lengths=batch['input_lengths'].to(self.device))
+                    all_hyps.extend(hyps)
+                    all_refs.extend(batch['texts'])
+                except Exception as e:
+                    n_failed += len(batch['texts'])
+                    log(f"  [WARN] Generation failed on a selection batch: {e}")
+            covered = len(all_hyps)
+            log(f"  [Selection] generated {covered}/{self._gen_target} clips"
+                + (f" ({n_failed} failed)" if n_failed else ""))
+            if covered < self._gen_target:
+                log(f"  [WARN] selection coverage incomplete -- metrics this "
+                    f"epoch are NOT comparable to a full-coverage epoch")
 
         avg_loss = total_loss / max(num_batches, 1)
 
@@ -1423,14 +1524,13 @@ class MT5Trainer:
         if is_main() and all_refs and all_hyps:
             metrics['n_gen'] = len(all_hyps)
             try:
-                import editdistance
-                total_dist, total_words = 0, 0
-                for r, h in zip(all_refs, all_hyps):
-                    rd = r.strip().split()
-                    hd = h.strip().split()
-                    total_dist += editdistance.eval(rd, hd)
-                    total_words += len(rd)
-                metrics['wer'] = total_dist / max(total_words, 1)
+                # Shared implementation (E0) -- identical to the one
+                # scripts/evaluate_phase1.py calls, and normalized the same
+                # way as BLEU/ROUGE below. Previously this was raw
+                # whitespace-token WER alongside a normalized BLEU.
+                metrics['wer'] = compute_corpus_wer(all_refs, all_hyps)
+                metrics['wer_raw'] = compute_corpus_wer(
+                    all_refs, all_hyps, normalize=False)
             except ImportError:
                 log("[WARN] pip install editdistance for WER")
 
@@ -1628,6 +1728,53 @@ def main():
                         help='LoRA rank (default: 16)')
     parser.add_argument('--lora-alpha', type=int, default=32,
                         help='LoRA alpha scaling (default: 32)')
+    parser.add_argument('--selection-manifest', default=None,
+                        help='JSON list of {clip_id,...} defining the FROZEN '
+                             'checkpoint-selection subset (see '
+                             'scripts/build_canonical_splits.py). Without it '
+                             'the trainer falls back to the first 25 val '
+                             'batches, which are 100%% informburo and cannot '
+                             'see most of the data.')
+    parser.add_argument('--block-padding-mask', action='store_true',
+                        help='Re-zero padded frames inside EVERY temporal '
+                             'ST-GCN block (E2). Without it, conv bias and '
+                             'BatchNorm shift make padding nonzero and the '
+                             'kernel-5 temporal convs mix it into real frames, '
+                             'so a clip embedding depends on batch padding. '
+                             'Makes eval exactly padding-invariant; training '
+                             'BatchNorm statistics still count padded frames.')
+    parser.add_argument('--unisign-preprocess', action='store_true',
+                        help='E3 arm B: exact port of upstream Uni-Sign pose '
+                             'preprocessing (9-joint body with real wrists, '
+                             'clip-level body box, wrist-relative hands, '
+                             'nose-relative face, (x,y,score) with score<=0.3 '
+                             'masked). Input dim 207. Exclusive with '
+                             '--use-enriched/--signspace/--real-wrists/--score-quantiles.')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='Seeds python, numpy and torch (CPU+CUDA). cuDNN '
+                             'kernels remain nondeterministic.')
+    parser.add_argument('--score-quantiles', default=None,
+                        help='Train-fitted score table (scripts/fit_score_quantiles.py). '
+                             'Replaces clip(score,0,1), which pins ~100%% of '
+                             'joints to 1.0 and makes the confidence channel '
+                             'constant. Changes encoder input; do not --resume '
+                             'a checkpoint trained without it.')
+    parser.add_argument('--real-wrists', action='store_true',
+                        help='Feed the body graph real wrist joints (E2). The '
+                             'legacy mapping repeats ELBOW values into the '
+                             'wrist nodes, so hand-anchor fusion reads a '
+                             'pseudo-wrist. Sets dataset and encoder together; '
+                             'changes encoder input, so do not --resume a '
+                             'checkpoint trained without it.')
+    parser.add_argument('--signspace', action='store_true',
+                        help='SignSpace pose normalization (arXiv:2507.01532): '
+                             'body scaled globally into a 3x-shoulder box, '
+                             'hands and face normalized locally and '
+                             'independently. Removes signer hand-size / '
+                             'camera-distance nuisance variation that the '
+                             'default single global shoulder-width divisor '
+                             'leaves in. Changes the input distribution, so '
+                             'do NOT --resume a checkpoint trained without it.')
     parser.add_argument('--use-enriched', action='store_true',
                         help='Use enriched pose features (offset+vel+acc+valid, 1128 dims)')
     parser.add_argument('--masked-pose-ratio', type=float, default=0.0,
@@ -1717,6 +1864,18 @@ def main():
                              'and always stays at its fresh init.')
     args = parser.parse_args()
 
+    import random as _random
+    _random.seed(args.seed)
+    import numpy as _np
+    _np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    if args.unisign_preprocess and (args.use_enriched or args.signspace
+                                    or args.real_wrists or args.score_quantiles):
+        parser.error('--unisign-preprocess is exclusive with --use-enriched, '
+                     '--signspace, --real-wrists and --score-quantiles')
+
     if args.prosody_aux_weight > 0 and not args.prosody_root:
         parser.error('--prosody-aux-weight > 0 requires --prosody-root')
 
@@ -1755,6 +1914,12 @@ def main():
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         use_enriched=args.use_enriched,
+        signspace=args.signspace,
+        selection_manifest=args.selection_manifest,
+        block_padding_mask=args.block_padding_mask,
+        real_wrists=args.real_wrists,
+        score_quantiles=args.score_quantiles,
+        unisign_preprocess=args.unisign_preprocess,
         masked_pose_ratio=args.masked_pose_ratio,
         overfit_n=args.overfit_n,
         ctc_weight=args.ctc_weight,

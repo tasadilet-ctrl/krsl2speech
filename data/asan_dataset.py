@@ -30,6 +30,12 @@ from data.utils import (
     assemble_keypoints,
     assemble_joint_scores,
     to_offset_keypoints,
+    signspace_global,
+    signspace_normalize,
+    forearm_offsets,
+    quantile_transform_scores,
+    unisign_part_features,
+    UNISIGN_DIM,
     enrich_keypoints,
     preprocess_keypoints,
     resample_prosody,
@@ -63,6 +69,10 @@ class AsanDataset(Dataset):
         split='train',           # 'train' | 'val'/'dev' | 'test' (predefined)
         lang='kz',
         tokenizer=None,
+        signspace=False,         # SignSpace normalization (arXiv:2507.01532)
+        real_wrists=False,       # E2: real wrist bones, see forearm_offsets
+        score_quantiles=None,    # E2: path to train-fitted score table
+        unisign_preprocess=False,  # E3 arm B: exact upstream Uni-Sign inputs
         min_frames=25,           # skip clips shorter than this (pre-downsample)
         max_frames=1000,         # truncate after downsampling
         downsample_every=1,
@@ -84,6 +94,17 @@ class AsanDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_frames = max_frames
         self.downsample_every = downsample_every
+        self.signspace = signspace
+        self.real_wrists = real_wrists
+        self.unisign_preprocess = unisign_preprocess
+        if unisign_preprocess and (use_enriched or signspace or real_wrists or score_quantiles):
+            raise ValueError(
+                "unisign_preprocess reproduces upstream Uni-Sign inputs exactly and "
+                "cannot be combined with use_enriched/signspace/real_wrists/score_quantiles")
+        self._score_table = None
+        if score_quantiles:
+            with open(os.path.expanduser(score_quantiles)) as fh:
+                self._score_table = json.load(fh)
         self.use_enriched = use_enriched
         self.ds_name = name or f"asan_{lang}"
         self.load_prosody = load_prosody
@@ -159,6 +180,10 @@ class AsanDataset(Dataset):
                   f"{kept}/{len(entries)} clips kept")
 
         enrich_tag = " enriched" if use_enriched else ""
+        enrich_tag += " signspace" if signspace else ""
+        enrich_tag += " real_wrists" if real_wrists else ""
+        enrich_tag += " score_quantiles" if score_quantiles else ""
+        enrich_tag += " unisign_preprocess" if unisign_preprocess else ""
         print(f"[{self.ds_name}] split={split}{enrich_tag} Total: "
               f"{len(self.clips)} clips ({n_filtered} filtered), "
               f"downsample={downsample_every}x")
@@ -167,9 +192,33 @@ class AsanDataset(Dataset):
         return len(self.clips)
 
     def _load_pose(self, entry):
-        """Load per-clip wholebody keypoints from the .pkl."""
-        pkl_path = os.path.join(self.root, entry['pose'])
-        with open(pkl_path, 'rb') as f:
+        """
+        Load per-clip wholebody keypoints.
+
+        Two on-disk formats are supported, because the sources were built by
+        different pipelines:
+          .pkl  — original asan-dataset (khabar, informburo, and the first
+                  qazaqstantv collection): {'keypoints': (T,1,133,2),
+                  'scores': (T,1,133)}.
+          .npz  — the 2026 qazaqstantv recollection: 'wb_xy' (T,133,2) and
+                  'wb_score' (T,133), already per-clip. Entries may carry a
+                  frame range; frame_start == frame_end == 0 is the
+                  recollection's "whole file" sentinel, NOT an empty slice.
+        """
+        pose_path = os.path.join(self.root, entry['pose'])
+
+        if pose_path.endswith('.npz'):
+            d = np.load(pose_path)
+            wb = np.asarray(d['wb_xy'], dtype=np.float32)      # (T, 133, 2)
+            sc = np.asarray(d['wb_score'], dtype=np.float32)   # (T, 133)
+            fs, fe = entry.get('frame_start'), entry.get('frame_end')
+            if fs is not None and fe is not None and fe > fs:
+                idx = np.asarray(d['frame_idx'])
+                keep = np.where((idx >= fs) & (idx < fe))[0]
+                wb, sc = wb[keep], sc[keep]
+            return wb, sc
+
+        with open(pose_path, 'rb') as f:
             d = pickle.load(f)
         wb = np.asarray(d['keypoints'], dtype=np.float32)   # (T, 1, 133, 2)
         sc = np.asarray(d['scores'], dtype=np.float32)      # (T, 1, 133)
@@ -211,6 +260,23 @@ class AsanDataset(Dataset):
             hand_r = hand_r[:self.max_frames]
             sc = sc[:self.max_frames]
 
+        # E3 arm B: upstream Uni-Sign preprocessing replaces the whole
+        # assemble -> normalize -> offset -> enrich path. Temporal handling
+        # above (downsample, truncation) is shared with the other arms, so the
+        # arms differ only in spatial preprocessing.
+        if self.unisign_preprocess:
+            kps = unisign_part_features(wb, sc)            # NaN in wb => score 0
+            return {
+                'keypoints': torch.tensor(kps, dtype=torch.float32),
+                'prosody': None, 'rgb': None, 'hand_crops': None,
+                'hand_ref': None, 'hand_valid': None, 'hand_score': None,
+                'text': entry['text'],
+                'text_ids': (torch.tensor(self.tokenizer.encode(entry['text']), dtype=torch.long)
+                             if self.tokenizer else None),
+                'input_length': len(kps),
+                'clip_id': entry.get('clip_id', ''),
+            }
+
         # Keep raw (NaN-marked) copies for the validity mask
         wb_raw, hl_raw, hr_raw = (wb.copy(), hand_l.copy(), hand_r.copy()) \
             if self.use_enriched else (None, None, None)
@@ -223,16 +289,48 @@ class AsanDataset(Dataset):
         # Signer-scale normalization + detector-spike removal
         kps = preprocess_keypoints(kps)
 
+        # SignSpace splits the two channels deliberately:
+        #   absolute channel -> signspace_global: every joint in the
+        #     body-centred box, so a hand's POSITION in signing space
+        #     survives.
+        #   offset channel   -> signspace_normalize: body global, but
+        #     hands/face normalized to their own boxes, so handshape is
+        #     invariant to hand size and camera distance.
+        # Doing local normalization on BOTH would erase signing location,
+        # and the body graph cannot restore it (the wrist slots carry
+        # repeated elbow values, not real wrists).
+        if self.signspace:
+            kps_abs_src = signspace_global(kps)
+            kps_off_src = signspace_normalize(kps)
+        else:
+            kps_abs_src = kps_off_src = kps
+
         # Keep absolute coordinates for the dual-coord enriched channel
-        kps_abs = kps.copy() if self.use_enriched else None
+        kps_abs = kps_abs_src.copy() if self.use_enriched else None
 
         # Offset features (translation-invariant), then optional enrichment
-        kps = to_offset_keypoints(kps)
+        kps = to_offset_keypoints(kps_off_src)
+
+        # Real wrists (E2): write the true forearm vector (wrist - elbow) into
+        # the hand-root offset slots, which to_offset_keypoints always leaves
+        # at zero. Computed from the GLOBAL-frame source so its units match
+        # the body group's other bones even under SignSpace. The encoder must
+        # be built with real_wrists=True to read these slots as wrists; it
+        # zeroes them again before the hand graph, so hand input is unchanged.
+        if self.real_wrists:
+            fl, fr = forearm_offsets(kps_abs_src)
+            kps[:, 198:200] = fl
+            kps[:, 240:242] = fr
         if self.use_enriched:
             # Continuous per-joint confidence → validity channel
             # (score-aware, Uni-Sign). Undetected joints already have
             # score <= 0 or NaN, which clips to 0.
             joint_scores = assemble_joint_scores(np.nan_to_num(sc, nan=0.0))
+            if self._score_table is not None:
+                # E2: raw RTMPose scores are >= 1 for ~100% of joints, so the
+                # old clip-to-[0,1] made this channel constant. Rank-transform
+                # against the train-fitted table instead.
+                joint_scores = quantile_transform_scores(joint_scores, self._score_table)
             kps = enrich_keypoints(kps, wb_raw, hl_raw, hr_raw,
                                    kps_abs=kps_abs, joint_scores=joint_scores)
 
@@ -343,7 +441,8 @@ class AsanDataset(Dataset):
         }
 
     def _blank_sample(self):
-        dim = ENRICHED_DIM() if self.use_enriched else KEYPOINT_DIM
+        dim = (UNISIGN_DIM if self.unisign_preprocess
+               else ENRICHED_DIM() if self.use_enriched else KEYPOINT_DIM)
         return {
             'keypoints': torch.zeros(1, dim),
             'prosody': None,

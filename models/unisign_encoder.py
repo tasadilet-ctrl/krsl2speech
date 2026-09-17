@@ -234,11 +234,26 @@ class STGCN_block(nn.Module):
             )
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, x, len_x=None):
+    def forward(self, x, len_x=None, pad_mask=None):
+        """
+        pad_mask: optional (B, 1, T, 1) bool, True at padded frames.
+
+        Without it this is the exact Uni-Sign block. With it, padded frames
+        are re-zeroed after the GCN unit -- whose conv bias and BatchNorm
+        shift make them nonzero -- so the kernel-5 temporal conv that follows
+        sees true zeros there, exactly as it would see its own zero padding
+        at the end of an unpadded clip. The output is re-zeroed too, so the
+        NEXT block starts clean. In eval mode this makes a clip's embedding
+        independent of how much padding its batch added.
+        """
         res = self.residual(x)
         x = self.gcn(x, len_x)
-        x = self.tcn(x) + res
-        return self.relu(x)
+        if pad_mask is not None:
+            x = x.masked_fill(pad_mask, 0.0)
+        x = self.relu(self.tcn(x) + res)
+        if pad_mask is not None:
+            x = x.masked_fill(pad_mask, 0.0)
+        return x
 
 
 class STGCNChain(nn.Sequential):
@@ -255,6 +270,13 @@ class STGCNChain(nn.Sequential):
                                 A.clone(), adaptive),
                 )
                 last_dim = channel
+
+    def forward(self, x, pad_mask=None):
+        # nn.Sequential cannot thread an extra argument through its children,
+        # so iterate explicitly. pad_mask=None is identical to Sequential.
+        for block in self:
+            x = block(x, pad_mask=pad_mask)
+        return x
 
 
 def get_stgcn_chain(in_dim, level, kernel_size, A, adaptive):
@@ -275,7 +297,7 @@ def get_stgcn_chain(in_dim, level, kernel_size, A, adaptive):
 # Key Point Mapper: COCO-WholeBody → Uni-Sign format
 # ============================================================
 
-def _map_coco_to_unisign_body(coco_body_xy):
+def _map_coco_to_unisign_body(coco_body_xy, wrists=None):
     """
     Map COCO-WholeBody body points (11 nodes) → Uni-Sign body (9 nodes).
 
@@ -311,8 +333,14 @@ def _map_coco_to_unisign_body(coco_body_xy):
     body_out[:, :, 4] = coco_body_xy[:, :, 6]    # r_shoulder
     body_out[:, :, 5] = coco_body_xy[:, :, 7]    # l_elbow
     body_out[:, :, 6] = coco_body_xy[:, :, 8]    # r_elbow
-    body_out[:, :, 7] = coco_body_xy[:, :, 7]    # l_wrist ≈ l_elbow (no wrist in BODY_IDX)
-    body_out[:, :, 8] = coco_body_xy[:, :, 8]    # r_wrist ≈ r_elbow
+    if wrists is None:
+        # Legacy: no wrist source, so repeat the elbow. Kept as the default so
+        # existing checkpoints reproduce; see map_keypoints_to_unisign_format.
+        body_out[:, :, 7] = coco_body_xy[:, :, 7]    # l_wrist ≈ l_elbow
+        body_out[:, :, 8] = coco_body_xy[:, :, 8]    # r_wrist ≈ r_elbow
+    else:
+        body_out[:, :, 7] = wrists[0]                # real left wrist
+        body_out[:, :, 8] = wrists[1]                # real right wrist
     return body_out
 
 
@@ -338,7 +366,7 @@ def _map_coco_to_unisign_face(coco_face_xy):
     return face_out
 
 
-def map_keypoints_to_unisign_format(kps_raw):
+def map_keypoints_to_unisign_format(kps_raw, real_wrists=False):
     """
     Convert raw COCO-WholeBody keypoints to Uni-Sign format.
 
@@ -367,15 +395,31 @@ def map_keypoints_to_unisign_format(kps_raw):
     hand_l_xy = kps_raw[:, :, 198:240].reshape(B, T, 21, 2)
     hand_r_xy = kps_raw[:, :, 240:282].reshape(B, T, 21, 2)
 
+    # Real wrists (E2). With real_wrists the dataset has written the true
+    # forearm vector (wrist - elbow, data/utils.py::forearm_offsets) into each
+    # hand group's ROOT offset slot, which is otherwise always zero. Read it
+    # out for the body graph's wrist nodes, then zero the root again so the
+    # hand graph's own input is exactly what it was without the flag. Only
+    # valid when the dataset was built with real_wrists=True as well.
+    offset_wrists = abs_wrists = None
+    if real_wrists:
+        offset_wrists = (hand_l_xy[:, :, 0].clone(), hand_r_xy[:, :, 0].clone())
+        hand_l_xy = hand_l_xy.clone(); hand_l_xy[:, :, 0] = 0.0
+        hand_r_xy = hand_r_xy.clone(); hand_r_xy[:, :, 0] = 0.0
+
     # Map to Uni-Sign format
-    body_mapped = _map_coco_to_unisign_body(body_xy)
+    body_mapped = _map_coco_to_unisign_body(body_xy, wrists=offset_wrists)
     face_mapped = _map_coco_to_unisign_face(face_xy[:, :, :68, :])
 
     # Dual-coords: append the absolute portion through the same mappings
     if dual:
         abs_part = kps_raw[:, :, 282:564]
+        if real_wrists:
+            # Absolute wrist = hand-root absolute position (same per-clip
+            # standardized frame as every other absolute joint).
+            abs_wrists = (abs_part[:, :, 198:200], abs_part[:, :, 240:242])
         body_abs = _map_coco_to_unisign_body(
-            abs_part[:, :, 0:22].reshape(B, T, 11, 2))
+            abs_part[:, :, 0:22].reshape(B, T, 11, 2), wrists=abs_wrists)
         face_abs = _map_coco_to_unisign_face(
             abs_part[:, :, 22:198].reshape(B, T, 88, 2)[:, :, :68, :])
         hand_l_abs = abs_part[:, :, 198:240].reshape(B, T, 21, 2)
@@ -401,11 +445,18 @@ def map_keypoints_to_unisign_format(kps_raw):
         body_score[:, :, 4] = body_valid[:, :, 6].mean(dim=-1, keepdim=True)   # r_shoulder
         body_score[:, :, 5] = body_valid[:, :, 7].mean(dim=-1, keepdim=True)   # l_elbow
         body_score[:, :, 6] = body_valid[:, :, 8].mean(dim=-1, keepdim=True)   # r_elbow
-        body_score[:, :, 7] = body_score[:, :, 5]  # l_wrist ≈ l_elbow validity
-        body_score[:, :, 8] = body_score[:, :, 6]  # r_wrist ≈ r_elbow validity
-
         hand_l_valid = validity[:, :, 198:240].reshape(B, T, 21, 2)
         hand_r_valid = validity[:, :, 240:282].reshape(B, T, 21, 2)
+        if real_wrists:
+            # A real wrist is only as reliable as the weaker of the hand-root
+            # detection and the elbow it hangs from.
+            body_score[:, :, 7] = torch.minimum(
+                hand_l_valid[:, :, 0].mean(dim=-1, keepdim=True), body_score[:, :, 5])
+            body_score[:, :, 8] = torch.minimum(
+                hand_r_valid[:, :, 0].mean(dim=-1, keepdim=True), body_score[:, :, 6])
+        else:
+            body_score[:, :, 7] = body_score[:, :, 5]  # l_wrist ≈ l_elbow validity
+            body_score[:, :, 8] = body_score[:, :, 6]  # r_wrist ≈ r_elbow validity
         hand_l_score = hand_l_valid.mean(dim=-1, keepdim=True)
         hand_r_score = hand_r_valid.mean(dim=-1, keepdim=True)
 
@@ -587,7 +638,9 @@ class KeypointEncoder(nn.Module):
 
     MODES = ['body', 'left', 'right', 'face_all']
 
-    def __init__(self, hidden_dim=768, pretrained_path=None, input_dim=282):
+    def __init__(self, hidden_dim=768, pretrained_path=None, input_dim=282,
+                 block_padding_mask=False, real_wrists=False,
+                 unisign_input=False):
         """
         Build Uni-Sign ST-GCN encoder.
 
@@ -607,6 +660,16 @@ class KeypointEncoder(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.input_dim = input_dim
+        # E2 padding repair, off by default so existing checkpoints reproduce
+        # their recorded outputs. See STGCN_block.forward.
+        self.block_padding_mask = block_padding_mask
+        # E2 real wrists; requires the dataset built with real_wrists=True.
+        self.real_wrists = real_wrists
+        # E3 arm B: input is the packed (x, y, score) upstream layout from
+        # data/utils.py::unisign_part_features, fed straight to the part graphs.
+        self.unisign_input = unisign_input
+        if unisign_input and input_dim != 207:
+            raise ValueError(f"unisign_input expects input_dim=207, got {input_dim}")
 
         # Build graphs and adjacency matrices
         self.graph = {}
@@ -663,7 +726,9 @@ class KeypointEncoder(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         enrich_tag = " (enriched input)" if input_dim > 282 else ""
         print(f"\n[KeypointEncoder] Uni-Sign architecture{enrich_tag}: {n_params:,} parameters")
-        print(f"  Input dim: {input_dim} ({'enriched' if input_dim > 282 else 'standard offset'})")
+        _kind = ('upstream Uni-Sign (x, y, score)' if unisign_input
+                 else 'enriched' if input_dim > 282 else 'standard offset')
+        print(f"  Input dim: {input_dim} ({_kind})")
         print(f"  Spatial STGCN: [[64,1], [128,1], [256,1]] per group")
         print(f"  Temporal STGCN: [[256,3]] per group")
         print(f"  Left/right hands share weights")
@@ -728,7 +793,11 @@ class KeypointEncoder(nn.Module):
             return x.masked_fill(pad_mask, 0.0)
 
         # Map to Uni-Sign format
-        parts = map_keypoints_to_unisign_format(kps_raw)
+        if self.unisign_input:
+            from data.utils import unpack_unisign_parts
+            parts = unpack_unisign_parts(kps_raw)
+        else:
+            parts = map_keypoints_to_unisign_format(kps_raw, real_wrists=self.real_wrists)
 
         # Process each group
         features = []
@@ -775,7 +844,10 @@ class KeypointEncoder(nn.Module):
             # be true zero at pad positions (guaranteed by zero_pad above)
             # or the conv blends a learned pad-artifact into the last ~2
             # real frames of every clip shorter than the batch max.
-            gcn_feat = self.fusion_gcn_modules[part](gcn_feat)  # (B, 256, T, V)
+            gcn_feat = self.fusion_gcn_modules[part](
+                gcn_feat,
+                pad_mask=pad_mask if self.block_padding_mask else None,
+            )  # (B, 256, T, V)
             gcn_feat = zero_pad(gcn_feat)  # keep pad frames clean for downstream consumers
 
             # Mean pool over nodes

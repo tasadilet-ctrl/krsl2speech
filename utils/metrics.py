@@ -34,6 +34,37 @@ def compute_batch_wer_cer(references, hypotheses):
     return sum(wers) / len(wers), sum(cers) / len(cers)
 
 
+def compute_corpus_wer(references, hypotheses, normalize=True):
+    """
+    Corpus-level WER: total edit distance / total reference words.
+
+    This is the single shared WER used by BOTH train/train_encoder_mt5.py and
+    scripts/evaluate_phase1.py. Before E0 they disagreed: the trainer used raw
+    whitespace tokens while this module's compute_wer() normalized, and the
+    trainer's own BLEU was normalized while its WER was not -- so trainer and
+    evaluator numbers were not comparable, and the trainer's two headline
+    metrics were not even normalized the same way as each other.
+
+    Note this is corpus WER (pooled edits over pooled words), NOT the mean of
+    per-clip WERs that compute_batch_wer_cer returns. The two differ whenever
+    clip lengths vary; corpus WER is the standard reported figure.
+
+    normalize=True applies normalize_kazakh (lowercase, strip punctuation),
+    matching compute_bleu/compute_rouge. Pass False for the raw figure.
+    """
+    import editdistance
+    if not references or not hypotheses:
+        return 0.0
+    total_dist = total_words = 0
+    for r, h in zip(references, hypotheses):
+        if normalize:
+            r, h = normalize_kazakh(r), normalize_kazakh(h)
+        r_toks, h_toks = r.strip().split(), h.strip().split()
+        total_dist += editdistance.eval(r_toks, h_toks)
+        total_words += len(r_toks)
+    return total_dist / max(total_words, 1)
+
+
 def compute_bleu(references, hypotheses):
     """
     Corpus-level BLEU (sacrebleu -- the reproducible, citable implementation;

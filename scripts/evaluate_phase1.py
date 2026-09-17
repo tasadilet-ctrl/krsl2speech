@@ -120,19 +120,24 @@ def main():
         sys.exit(1)
 
     # ---- Metrics ----
+    # E0: identical implementations to the trainer's. These two entry points
+    # previously disagreed -- raw WER here vs raw WER there but NORMALIZED
+    # BLEU in the trainer and RAW BLEU here -- so numbers from a training log
+    # and from this script were never comparable. Both figures are printed
+    # and labelled so older raw numbers remain interpretable.
+    from utils.metrics import compute_corpus_wer, compute_bleu
     try:
-        import editdistance
-        d = sum(editdistance.eval(r.split(), h.split()) for r, h in zip(refs, hyps))
-        n = sum(len(r.split()) for r in refs)
-        print(f"WER:   {d / max(n, 1):.4f}")
+        print(f"WER:   {compute_corpus_wer(refs, hyps):.4f}  (normalized)")
+        print(f"WER:   {compute_corpus_wer(refs, hyps, normalize=False):.4f}  (raw)")
     except ImportError:
         print("WER:   (pip install editdistance)")
 
     try:
         import sacrebleu
-        bleu = sacrebleu.corpus_bleu(hyps, [refs])
         chrf = sacrebleu.corpus_chrf(hyps, [refs])
-        print(f"BLEU:  {bleu.score:.2f}")
+        print(f"BLEU:  {compute_bleu(refs, hyps):.2f}  (normalized)")
+        print(f"BLEU:  {sacrebleu.corpus_bleu(hyps, [refs]).score:.2f}  (raw)")
+        print(f"sacrebleu signature: {sacrebleu.corpus_bleu(hyps, [refs]).get_signature()}")
         print(f"chrF2: {chrf.score:.2f}")
     except ImportError:
         print("BLEU/chrF: (pip install sacrebleu)")

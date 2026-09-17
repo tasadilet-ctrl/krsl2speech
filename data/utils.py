@@ -2,6 +2,8 @@
 Shared utilities for loading keypoints and extracting prosody.
 """
 import os
+import warnings
+
 import numpy as np
 import librosa
 import torch
@@ -382,10 +384,199 @@ def remove_keypoint_spikes(kps, thresh=1.5):
     return kps
 
 
-def preprocess_keypoints(kps, despike_thresh=1.5):
-    """Standard preprocessing: signer-scale normalization + spike removal."""
+def _normalize_group_local(coords, eps=1e-6):
+    """
+    Frame-wise local normalization of one keypoint group.
+
+    coords: (T, N, 2) -> centred on the group's own per-frame bounding-box
+    centre and divided by HALF ITS LARGER SIDE, so the group lands in
+    [-1, 1] with aspect ratio preserved (a single isotropic scale, not
+    independent x/y scales -- squashing a hand to a square would destroy
+    the handshape this is meant to expose).
+
+    Undetected joints arrive imputed to exactly (0, 0) from
+    AsanDataset.__getitem__. They are excluded from the box and left at
+    (0, 0) on the way out, matching what normalize_signer_scale already
+    did (it maps 0 to 0). The validity channel is derived separately from
+    the pre-imputation NaN arrays, so nothing is lost by that choice.
+    """
+    valid = ~((coords[..., 0] == 0) & (coords[..., 1] == 0))    # (T, N)
+    masked = np.where(valid[..., None], coords, np.nan)
+
+    # A frame where this whole group went undetected is an all-NaN slice.
+    # That is expected on real data (an occluded hand), and is handled by
+    # the `usable` mask below -- so silence the warning rather than let it
+    # spam training logs once per such frame.
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        lo = np.nanmin(masked, axis=1)      # (T, 2)
+        hi = np.nanmax(masked, axis=1)      # (T, 2)
+
+        centre = (lo + hi) / 2.0                                # (T, 2)
+        half = np.nanmax(hi - lo, axis=1) / 2.0                 # (T,)
+
+    # Frames with no detected joint (all-NaN) or a degenerate box: leave
+    # the frame untouched rather than dividing by ~0 and exploding it.
+    usable = np.isfinite(half) & (half > eps) & np.isfinite(centre).all(axis=1)
+    if not usable.any():
+        return coords
+
+    out = coords.copy()
+    c = np.where(usable[:, None], centre, 0.0)
+    h = np.where(usable, half, 1.0)
+    out = (out - c[:, None, :]) / h[:, None, None]
+
+    out[~usable] = coords[~usable]      # untouched frames keep raw values
+    out[~valid] = 0.0                   # re-assert the imputation sentinel
+    return out
+
+
+def _body_box(kps, eps):
+    """
+    SignSpace body box: centre = shoulder midpoint, half-side = 1.5x the
+    shoulder distance (so the full side is 3x, per the paper).
+
+    Returns (centre (T,2), half (T,)) or None when no frame has both
+    shoulders. Frame-wise as the paper specifies, but a frame missing a
+    shoulder falls back to the clip median so one dropped detection cannot
+    rescale that frame into a different space from its neighbours.
+    """
+    ls, rs = kps[:, _L_SHOULDER], kps[:, _R_SHOULDER]
+    have = (np.abs(ls).sum(axis=1) > 0) & (np.abs(rs).sum(axis=1) > 0)
+    if not have.any():
+        return None
+
+    centre = (ls + rs) / 2.0
+    shoulder = np.linalg.norm(ls - rs, axis=1)
+    median_sh = np.median(shoulder[have])
+    if median_sh < eps:
+        return None
+
+    shoulder = np.where(have & (shoulder > eps), shoulder, median_sh)
+    centre[~have] = centre[have].mean(axis=0)
+    return centre, 1.5 * shoulder
+
+
+def signspace_global(kps, eps=1e-6):
+    """
+    Body-centred SignSpace box applied to EVERY joint, hands and face
+    included -- an isotropic, signer-scale-invariant frame in which a
+    hand's POSITION still means something.
+
+    This is the anchor half of the scheme. Use it for the absolute
+    coordinate channel, so that normalizing handshape locally (below)
+    does not also destroy where in the signing space the hand was.
+
+    Input/Output: (T, 282).
+    """
+    box = _body_box(kps, eps)
+    if box is None:
+        return kps
+    centre, half = box
+
+    out = kps.copy().astype(np.float32)
+    T = out.shape[0]
+    for g in GROUPS:
+        start, dim, n = g['start'], g['dim'], g['num_nodes']
+        coords = out[:, start:start + dim].reshape(T, n, 2)
+        valid = ~((coords[..., 0] == 0) & (coords[..., 1] == 0))
+        coords = (coords - centre[:, None, :]) / half[:, None, None]
+        coords[~valid] = 0.0
+        out[:, start:start + dim] = coords.reshape(T, dim)
+    return out
+
+
+def signspace_normalize(kps, eps=1e-6,
+                        local_groups=('face', 'left_hand', 'right_hand')):
+    """
+    SignSpace normalization (Exploring Pose-based SLT, arXiv:2507.01532).
+
+    Two different treatments, which is the whole point:
+      * BODY -- global: the body box from _body_box, mapped to [-1, 1].
+        Keeps the spatial relationship between body parts, which is
+        linguistically meaningful in sign.
+      * FACE / LEFT_HAND / RIGHT_HAND -- local and independent, each to its
+        own per-frame box (see _normalize_group_local), so the same
+        handshape gives the same features regardless of the signer's hand
+        size or distance from the camera.
+
+    IMPORTANT -- this output is for the OFFSET/bone channel only. Local
+    normalization deliberately discards each hand's position, and our body
+    graph cannot give it back (_map_coco_to_unisign_body fills the wrist
+    slots with repeated ELBOW values, so the encoder's hand-anchor fusion
+    is reading a pseudo-wrist). Pair this with signspace_global() for the
+    absolute-coordinate channel, which retains the anchor. Callers that
+    use only this function will lose signing location entirely.
+
+    Published effect, How2Sign BLEU-4: none 0.73, frame-wise 1.13,
+    SignSpace 2.17 -- their largest single ablation effect. That is
+    evidence for testing it here, not a predicted KRSL gain.
+
+    Input/Output: (T, 282).
+    """
+    out = signspace_global(kps, eps=eps)
+    T = out.shape[0]
+    for g in GROUPS:
+        if g['name'] not in local_groups:
+            continue
+        start, dim, n = g['start'], g['dim'], g['num_nodes']
+        coords = out[:, start:start + dim].reshape(T, n, 2)
+        out[:, start:start + dim] = _normalize_group_local(
+            coords, eps=eps).reshape(T, dim)
+    return out
+
+
+# Assembled (T, 282) layout slots used by forearm_offsets / real wrists.
+_L_ELBOW = slice(14, 16)       # body local node 7 (COCO 7, left elbow)
+_R_ELBOW = slice(16, 18)       # body local node 8 (COCO 8, right elbow)
+_L_HAND_ROOT = slice(198, 200)  # left-hand group node 0 = left wrist
+_R_HAND_ROOT = slice(240, 242)  # right-hand group node 0 = right wrist
+
+
+def forearm_offsets(kps):
+    """
+    Real wrist bone vectors: wrist - elbow, per side.
+
+    kps must be GLOBAL-frame coordinates (legacy shoulder-scaled, or
+    signspace_global) -- the same frame the body group's other bone offsets
+    were computed in. Never pass signspace_normalize output: its hands sit
+    in their own local boxes, so wrist - elbow there mixes two spaces.
+
+    Why this exists: to_offset_keypoints leaves every hand ROOT at zero (it
+    has no parent inside the hand group), and _map_coco_to_unisign_body had
+    no wrist source, so it repeated elbow features into the wrist slots. The
+    encoder's hand-anchor fusion was therefore reading a pseudo-wrist. The
+    wrist is the hand detector's root joint; this recovers the forearm in
+    consistent units so it can be written into the (otherwise always-zero)
+    hand-root offset slots.
+
+    Returns (left (T, 2), right (T, 2)); zero where wrist or elbow undetected
+    (imputed to exactly (0, 0)), so a missing hand cannot turn into a huge
+    bogus "elbow to origin" vector.
+    """
+    out = []
+    for wrist_sl, elbow_sl in ((_L_HAND_ROOT, _L_ELBOW), (_R_HAND_ROOT, _R_ELBOW)):
+        w, e = kps[:, wrist_sl], kps[:, elbow_sl]
+        ok = (np.abs(w).sum(axis=1) > 0) & (np.abs(e).sum(axis=1) > 0)
+        out.append(np.where(ok[:, None], w - e, 0.0).astype(np.float32))
+    return out[0], out[1]
+
+
+def preprocess_keypoints(kps, despike_thresh=1.5, signspace=False):
+    """
+    Standard preprocessing: signer-scale normalization + spike removal,
+    optionally followed by SignSpace normalization.
+
+    Order matters. remove_keypoint_spikes' threshold is expressed in
+    shoulder-width units, so it must run while the coordinates are still in
+    those units -- i.e. AFTER normalize_signer_scale and BEFORE
+    signspace_normalize, which re-derives its own per-group boxes and
+    would otherwise silently change what `despike_thresh` means.
+    """
     kps = normalize_signer_scale(kps)
     kps = remove_keypoint_spikes(kps, thresh=despike_thresh)
+    if signspace:
+        kps = signspace_normalize(kps)
     return kps
 
 
@@ -480,6 +671,112 @@ def assemble_joint_scores(wb_score, hand_l_score=None, hand_r_score=None):
         np.repeat(hr, 2, axis=1),         # (T, 42)
     ], axis=1)
     return scores.astype(np.float32)
+
+
+def quantile_transform_scores(joint_scores, table, floor=0.05):
+    """
+    Map raw detector scores (T, 282) through a TRAIN-fitted empirical CDF
+    per assembled group (scripts/fit_score_quantiles.py).
+
+    Detected joints land in [floor, 1]; undetected joints (NaN or <= 0) stay at
+    exactly 0, so detection remains distinguishable from the weakest detection.
+    Replaces clip(score, 0, 1), which pinned 99.6-100% of joints to 1.0.
+
+    Rank-normalized detector response -- NOT a calibrated probability.
+    """
+    out = np.zeros_like(joint_scores, dtype=np.float32)
+    probs = np.asarray(table['_meta']['probs'], dtype=np.float64)
+    for g in ('body', 'face', 'hands'):
+        a, b = table[g]['slice']
+        knots = np.asarray(table[g]['knots'], dtype=np.float64)
+        raw = joint_scores[:, a:b]
+        det = np.isfinite(raw) & (raw > 0)
+        cdf = np.interp(np.where(det, raw, knots[0]), knots, probs)
+        out[:, a:b] = np.where(det, floor + (1.0 - floor) * cdf, 0.0)
+    return out
+
+
+# ------------------------------------------------------------------------
+# Upstream Uni-Sign pose preprocessing (E3 arm B)
+# Port of load_part_kp / crop_scale from the official repository:
+# https://github.com/ZechengLi19/Uni-Sign/blob/main/datasets.py
+# ------------------------------------------------------------------------
+_US_BODY = [0] + list(range(3, 11))          # nose, ears, shoulders, elbows, WRISTS
+_US_FACE = list(range(23, 40))[::2] + list(range(83, 91)) + [53]   # 9 jaw + 8 mouth + nose tip
+_US_THR = 0.3
+UNISIGN_NODES = (('body', 9), ('left', 21), ('right', 21), ('face_all', 18))
+UNISIGN_DIM = 69 * 3                          # 207 = (9+21+21+18) nodes x (x, y, score)
+
+
+def unisign_part_features(wb_xy, wb_score, thr=_US_THR):
+    """
+    Exact port of Uni-Sign's pose preprocessing, so arm B feeds the pretrained
+    weights inputs with the meaning they were trained on.
+
+    Upstream semantics, reproduced deliberately (including the odd parts):
+      * body: 9 joints with REAL wrists, absolute coordinates; ONE clip-level
+        box over all frames' confident joints (score > thr), side = larger
+        extent, mapped to [-1, 1].
+      * hands: coordinates relative to that hand's own root (wrist) per frame,
+        divided by the body box scale.
+      * face_all: 18 points relative to the nose tip, divided by body scale.
+      * channels (x, y, score). np.clip(result, -1, 1) runs over the WHOLE
+        array, so the score channel is also capped at 1 upstream -- raw
+        RTMPose scores are >= 1 for ~100% of joints, so upstream's confidence
+        channel is saturated too. Not "fixed" here: this arm reproduces
+        upstream, it does not improve it.
+      * any joint with score <= thr is zeroed in all three channels.
+      * too few confident body joints (< 4) or zero extent => whole clip zero.
+
+    wb_xy (T, 133, 2) may contain NaN for undetected joints; those get score 0.
+    Returns (T, 207) float32: body, left, right, face_all, each (x, y, score).
+    """
+    xy = np.asarray(wb_xy, dtype=np.float64)
+    sc = np.asarray(wb_score, dtype=np.float64).copy()
+    missing = np.isnan(xy).any(axis=-1) | ~np.isfinite(sc)
+    sc[missing] = 0.0
+    xy = np.nan_to_num(xy, nan=0.0)
+    T = xy.shape[0]
+
+    def part(idx):
+        return np.concatenate([xy[:, idx], sc[:, idx, None]], axis=-1)   # (T, N, 3)
+
+    body = part(_US_BODY)
+    left = part(list(range(91, 112)));  left[..., :2] -= left[:, :1, :2]
+    right = part(list(range(112, 133))); right[..., :2] -= right[:, :1, :2]
+    face = part(_US_FACE);              face[..., :2] -= face[:, -1:, :2]
+
+    out = np.zeros((T, 69, 3), dtype=np.float64)
+    valid = body[body[..., 2] > thr][:, :2]
+    if len(valid) >= 4:
+        xmin, xmax = valid[:, 0].min(), valid[:, 0].max()
+        ymin, ymax = valid[:, 1].min(), valid[:, 1].max()
+        scale = max(xmax - xmin, ymax - ymin)
+        if scale > 0:
+            xs, ys = (xmin + xmax - scale) / 2, (ymin + ymax - scale) / 2
+            body[..., :2] = ((body[..., :2] - [xs, ys]) / scale - 0.5) * 2
+            parts = [body]
+            for p_ in (left, right, face):
+                p_[..., :2] = p_[..., :2] / scale
+                parts.append(p_)
+            o = 0
+            for p_ in parts:
+                p_ = np.clip(p_, -1, 1)              # clips score too, as upstream
+                p_[p_[..., 2] <= thr] = 0
+                out[:, o:o + p_.shape[1]] = p_
+                o += p_.shape[1]
+    return out.reshape(T, UNISIGN_DIM).astype(np.float32)
+
+
+def unpack_unisign_parts(kps):
+    """(B, T, 207) torch tensor -> {'body','left','right','face_all'}: (B, T, N, 3)."""
+    B, T, _ = kps.shape
+    v = kps.reshape(B, T, 69, 3)
+    parts, o = {}, 0
+    for name, n in UNISIGN_NODES:
+        parts[name] = v[:, :, o:o + n]
+        o += n
+    return parts
 
 
 def ENRICHED_DIM():
