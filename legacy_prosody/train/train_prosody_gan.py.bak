@@ -1,0 +1,353 @@
+"""
+Phase 2: Train Prosody GAN (SignRecGAN).
+Maps sign latents → prosody (F0, energy, duration) with sign reconstruction.
+"""
+import os
+import time
+import yaml
+import argparse
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.optim import Adam
+
+from data.khabar_dataset import KhabarKzDataset, KhabarKzCollator
+from data.kazsign_dataset import KazSignDataset, KazSignCollator
+from models.keypoint_encoder import KeypointEncoder
+from models.prosody_gan import ProsodyGAN
+from utils.losses import HingeAdversarialLoss, ProsodyL1Loss
+
+
+class ProsodyGANTrainer:
+    """Trainer for Phase 2: Prosody GAN."""
+
+    def __init__(self, config_path='configs/config.yaml', device='cuda'):
+        with open(config_path) as f:
+            self.config = yaml.safe_load(f)
+
+        self.device = device if torch.cuda.is_available() else 'cpu'
+        self.cfg = self.config['model']
+        self.train_cfg = self.config['training']['phase2']
+
+        # Load encoder (frozen, from Phase 1)
+        self.encoder = KeypointEncoder(
+            d_model=self.cfg['d_model'],
+            nhead=self.cfg['nhead'],
+            num_layers=self.cfg['num_encoder_layers'],
+            dim_feedforward=self.cfg['dim_feedforward'],
+            dropout=self.cfg['dropout'],
+        )
+
+        # Prosody GAN
+        self.gan = ProsodyGAN(
+            d_model=self.cfg['d_model'],
+            prosody_dim=self.cfg['prosody_dim'],
+        )
+
+        # Freeze encoder (optional — set to False for end-to-end)
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+
+        # Optimizers
+        self.optimizer_g = Adam(
+            self.gan.generator.parameters(),
+            lr=self.train_cfg['lr_generator'],
+            betas=(0.0, 0.9),
+        )
+        self.optimizer_d = Adam(
+            self.gan.discriminator.parameters(),
+            lr=self.train_cfg['lr_discriminator'],
+            betas=(0.0, 0.9),
+        )
+
+        # Losses
+        self.adv_loss = HingeAdversarialLoss()
+        self.prosody_loss_fn = ProsodyL1Loss()
+
+        # Metrics
+        self.best_loss = float('inf')
+
+        print(f"[Phase 2] Generator params: {sum(p.numel() for p in self.gan.generator.parameters()):,}")
+        print(f"[Phase 2] Discriminator params: {sum(p.numel() for p in self.gan.discriminator.parameters()):,}")
+        print(f"[Phase 2] Device: {self.device}")
+
+    def load_encoder(self, checkpoint_path):
+        """Load encoder weights from Phase 1."""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.encoder.load_state_dict(checkpoint['encoder'])
+        print(f"Loaded encoder from {checkpoint_path}")
+
+    def create_datasets(self, use_kazsign=True):
+        """Create training/validation datasets with prosody."""
+        paths = self.config['paths']
+        split = 0.9
+
+        if use_kazsign and os.path.exists(paths['kazsign']['root']):
+            dataset = KazSignDataset(
+                data_root=paths['kazsign']['root'],
+                keypoints_root=paths['kazsign']['keypoints'],
+                max_duration=60.0,
+                min_duration=2.0,
+                max_frames=1000,
+                load_prosody=True,
+            )
+        else:
+            # Fallback to khabar with audio
+            dataset = KhabarKzDataset(
+                manifest_path=paths['khabar_kz']['manifest'],
+                keypoints_root=paths['khabar_kz']['keypoints'],
+                audio_root=paths['khabar_source']['audio'],
+                max_duration=60.0,
+                min_duration=2.0,
+                max_frames=1000,
+                load_prosody=True,
+            )
+
+        n = len(dataset)
+        n_train = int(n * split)
+        train_set, val_set = torch.utils.data.random_split(
+            dataset, [n_train, n - n_train]
+        )
+
+        # Filter: only keep samples with prosody
+        def has_prosody(idx):
+            sample = dataset[idx]
+            return sample['prosody'] is not None and len(sample['prosody']) > 10
+
+        train_set = torch.utils.data.Subset(
+            train_set,
+            [i for i in range(len(train_set)) if has_prosody(i)]
+        )
+        val_set = torch.utils.data.Subset(
+            val_set,
+            [i for i in range(len(val_set)) if has_prosody(i)]
+        )
+
+        print(f"Train samples with prosody: {len(train_set)}")
+        print(f"Val samples with prosody: {len(val_set)}")
+
+        return train_set, val_set
+
+    def create_dataloaders(self):
+        """Create data loaders."""
+        train_set, val_set = self.create_datasets()
+        collator = KhabarKzCollator()  # same collation logic
+
+        train_loader = DataLoader(
+            train_set,
+            batch_size=self.train_cfg['batch_size'],
+            shuffle=True,
+            num_workers=4,
+            collate_fn=collator,
+            pin_memory=True,
+        )
+
+        val_loader = DataLoader(
+            val_set,
+            batch_size=self.train_cfg['batch_size'],
+            shuffle=False,
+            num_workers=2,
+            collate_fn=collator,
+            pin_memory=True,
+        )
+
+        return train_loader, val_loader
+
+    def train_epoch(self, train_loader):
+        """Train for one epoch."""
+        self.encoder.eval()  # frozen
+        self.gan.generator.train()
+        self.gan.discriminator.train()
+
+        total_g_loss = 0
+        total_d_loss = 0
+        num_batches = 0
+
+        for batch_idx, batch in enumerate(train_loader):
+            if batch is None or batch['prosody'] is None:
+                continue
+
+            kps = batch['keypoints'].to(self.device)   # (B, T, 304)
+            prosody = batch['prosody'].to(self.device)  # (B, 3, T)
+
+            # Get sign latents (no gradient — encoder frozen)
+            with torch.no_grad():
+                latent_full, _ = self.encoder(kps)  # (B, T+1, d_model)
+                sign_latent = latent_full[:, 1:, :]  # drop [CLS], (B, T, d_model)
+
+            # --- Train Discriminator ---
+            self.optimizer_d.zero_grad()
+
+            # Real prosody
+            real_score = self.gan.discriminator(prosody.detach())
+            d_real_loss = torch.mean(1.0 - real_score)
+
+            # Fake prosody
+            fake_prosody, _ = self.gan.generator(sign_latent.detach())
+            fake_score = self.gan.discriminator(fake_prosody)
+            d_fake_loss = torch.mean(fake_score)
+
+            d_loss = d_real_loss + d_fake_loss
+            d_loss.backward()
+            self.optimizer_d.step()
+
+            # --- Train Generator ---
+            self.optimizer_g.zero_grad()
+
+            fake_prosody, recon_kp = self.gan.generator(sign_latent)
+
+            # Adversarial loss
+            fake_score_gen = self.gan.discriminator(fake_prosody)
+            g_adv_loss = torch.mean(1.0 - fake_score_gen)
+
+            # Prosody L1 loss
+            g_prosody_loss = self.prosody_loss_fn(fake_prosody, prosody)
+
+            # Keypoint reconstruction loss
+            g_recon_loss = nn.functional.l1_loss(recon_kp, kps.transpose(1, 2))
+
+            lambda_adv = self.train_cfg['lambda_adv']
+            lambda_prosody = self.train_cfg['lambda_prosody']
+            lambda_recon = self.train_cfg['lambda_recon']
+
+            g_loss = (lambda_adv * g_adv_loss +
+                      lambda_prosody * g_prosody_loss +
+                      lambda_recon * g_recon_loss)
+
+            g_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.gan.generator.parameters(), max_norm=1.0)
+            self.optimizer_g.step()
+
+            total_g_loss += g_loss.item()
+            total_d_loss += d_loss.item()
+            num_batches += 1
+
+            if batch_idx % 100 == 0:
+                print(f"  Batch {batch_idx} | G: {g_loss.item():.4f} | D: {d_loss.item():.4f}")
+
+        return total_g_loss / max(num_batches, 1), total_d_loss / max(num_batches, 1)
+
+    @torch.no_grad()
+    def validate(self, val_loader):
+        """Validate."""
+        self.encoder.eval()
+        self.gan.generator.eval()
+        self.gan.discriminator.eval()
+
+        total_prosody_loss = 0
+        total_recon_loss = 0
+        num_batches = 0
+
+        for batch in val_loader:
+            if batch is None or batch['prosody'] is None:
+                continue
+
+            kps = batch['keypoints'].to(self.device)
+            prosody = batch['prosody'].to(self.device)
+
+            latent_full, _ = self.encoder(kps)
+            sign_latent = latent_full[:, 1:, :]
+
+            fake_prosody, recon_kp = self.gan.generator(sign_latent)
+
+            prosody_l = nn.functional.l1_loss(fake_prosody, prosody)
+            recon_l = nn.functional.l1_loss(recon_kp, kps.transpose(1, 2))
+
+            total_prosody_loss += prosody_l.item()
+            total_recon_loss += recon_l.item()
+            num_batches += 1
+
+        avg_prosody = total_prosody_loss / max(num_batches, 1)
+        avg_recon = total_recon_loss / max(num_batches, 1)
+
+        return avg_prosody, avg_recon
+
+    def train(self, num_epochs=None, encoder_checkpoint=None, save_dir=None):
+        """Main training loop."""
+        if num_epochs is None:
+            num_epochs = self.train_cfg['max_epochs']
+
+        if save_dir is None:
+            save_dir = self.config['paths']['output']
+        os.makedirs(save_dir, exist_ok=True)
+
+        if encoder_checkpoint:
+            self.load_encoder(encoder_checkpoint)
+
+        train_loader, val_loader = self.create_dataloaders()
+
+        print(f"\n{'='*60}")
+        print(f"Phase 2: Prosody GAN (SignRecGAN)")
+        print(f"Training epochs: {num_epochs}")
+        print(f"{'='*60}\n")
+
+        for epoch in range(num_epochs):
+            epoch_start = time.time()
+
+            # Train
+            g_loss, d_loss = self.train_epoch(train_loader)
+
+            # Validate
+            val_prosody, val_recon = self.validate(val_loader)
+
+            epoch_time = time.time() - epoch_start
+            total_val = val_prosody + val_recon
+
+            print(f"\nEpoch {epoch+1}/{num_epochs} | "
+                  f"G: {g_loss:.4f} | D: {d_loss:.4f} | "
+                  f"Val Prosody: {val_prosody:.4f} | "
+                  f"Val Recon: {val_recon:.4f} | "
+                  f"Time: {epoch_time:.1f}s")
+
+            # Save best
+            if total_val < self.best_loss:
+                self.best_loss = total_val
+                torch.save({
+                    'encoder': self.encoder.state_dict(),
+                    'generator': self.gan.generator.state_dict(),
+                    'discriminator': self.gan.discriminator.state_dict(),
+                    'epoch': epoch,
+                    'val_prosody': val_prosody,
+                    'val_recon': val_recon,
+                }, os.path.join(save_dir, 'phase2_best.pth'))
+                print(f"  ✓ Saved best model")
+
+            if (epoch + 1) % 10 == 0:
+                torch.save({
+                    'generator': self.gan.generator.state_dict(),
+                    'discriminator': self.gan.discriminator.state_dict(),
+                    'epoch': epoch,
+                }, os.path.join(save_dir, f'phase2_epoch{epoch+1}.pth'))
+
+    def save(self, path):
+        torch.save({
+            'generator': self.gan.generator.state_dict(),
+            'discriminator': self.gan.discriminator.state_dict(),
+        }, path)
+
+    def load(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+        self.gan.generator.load_state_dict(checkpoint['generator'])
+        self.gan.discriminator.load_state_dict(checkpoint['discriminator'])
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default='configs/config.yaml')
+    parser.add_argument('--encoder-checkpoint', required=True,
+                        help='Phase 1 encoder checkpoint')
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--save-dir', default=None)
+    parser.add_argument('--device', default='cuda')
+    args = parser.parse_args()
+
+    trainer = ProsodyGANTrainer(config_path=args.config, device=args.device)
+    trainer.train(
+        num_epochs=args.epochs,
+        encoder_checkpoint=args.encoder_checkpoint,
+        save_dir=args.save_dir,
+    )
+
+
+if __name__ == '__main__':
+    main()
