@@ -941,6 +941,14 @@ class MT5Trainer:
         # must be added or it would silently never train
         param_groups.append({'params': core.pose_norm.parameters(), 'lr': base_lr})
 
+        # E5 alignment heads: same trap as pose_norm above -- explicit param
+        # groups mean an unlisted module silently never trains, and a frozen
+        # random projection turns the contrastive term into noise.
+        if core.align_pose_head is not None:
+            param_groups.append({'params': core.align_pose_head.parameters(), 'lr': base_lr})
+            param_groups.append({'params': core.align_text_head.parameters(), 'lr': base_lr})
+            param_groups.append({'params': [core.align_logit_scale], 'lr': base_lr})
+
         if core.masked_pose_decoder is not None:
             param_groups.append({'params': core.masked_pose_decoder.parameters(), 'lr': base_lr})
 
@@ -955,6 +963,32 @@ class MT5Trainer:
             param_groups.append({'params': core.pgf_hand_fusion.parameters(), 'lr': base_lr})
             param_groups.append({'params': core.pgf_gate.parameters(), 'lr': base_lr})
             param_groups.append({'params': core.pgf_keypoint_adapter.parameters(), 'lr': base_lr})
+
+        # Several groups above are appended as GENERATORS (e.g.
+        # core.mt5.parameters()). Materialise them first: merely iterating a
+        # generator to inspect it exhausts it, and AdamW would then receive an
+        # empty param list and silently train nothing in that group.
+        for g in param_groups:
+            g['params'] = list(g['params'])
+
+        # Guard: explicit param groups silently drop any module not listed
+        # above (this bit pose_norm once, and the E5 align heads once). A
+        # frozen-by-accident head produces a plausible-looking loss that
+        # cannot fall, so fail loudly instead.
+        in_groups = {id(p) for g in param_groups for p in g['params']}
+        missing = sorted({n for n, p in self.model.named_parameters()
+                          if p.requires_grad and id(p) not in in_groups})
+        if missing:
+            raise RuntimeError(
+                f"{len(missing)} trainable parameters are in no optimizer group "
+                f"and would never train: {missing[:8]}"
+                + (" ..." if len(missing) > 8 else ""))
+
+        n_opt = sum(p.numel() for g in param_groups for p in g['params'])
+        n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        log(f"[Optimizer] {len(param_groups)} groups, {n_opt:,} params "
+            f"({n_train:,} trainable in model)")
+        assert n_opt == n_train, "optimizer/model trainable parameter mismatch"
 
         self.optimizer = AdamW(param_groups, weight_decay=0.01)
 
