@@ -708,7 +708,7 @@ UNISIGN_NODES = (('body', 9), ('left', 21), ('right', 21), ('face_all', 18))
 UNISIGN_DIM = 69 * 3                          # 207 = (9+21+21+18) nodes x (x, y, score)
 
 
-def unisign_part_features(wb_xy, wb_score, thr=_US_THR):
+def unisign_part_features(wb_xy, wb_score, thr=_US_THR, hand_ratio=None):
     """
     Exact port of Uni-Sign's pose preprocessing, so arm B feeds the pretrained
     weights inputs with the meaning they were trained on.
@@ -730,6 +730,18 @@ def unisign_part_features(wb_xy, wb_score, thr=_US_THR):
 
     wb_xy (T, 133, 2) may contain NaN for undetected joints; those get score 0.
     Returns (T, 207) float32: body, left, right, face_all, each (x, y, score).
+
+    hand_ratio (E3 arm D, SignSpace-style hand scaling): None reproduces
+    upstream exactly. Given a float r -- the TRAIN-fitted median of
+    (hand extent / body box scale), see scripts/fit_hand_ratio.py -- each hand
+    is rescaled PER FRAME so its extent equals r body-units:
+        hand_body_units * (r / this_frame_ratio)
+    Wrist-relative coordinates and body-box units are kept, so values stay in
+    the range the pretrained Uni-Sign weights expect; only the signer's hand
+    size / camera distance is removed. Plain SignSpace (stretch every hand to
+    [-1, 1]) was rejected for exactly that reason: E3 arm B showed a mismatch
+    with pretrained input semantics costs more than normalization gains.
+    Frames with < 2 confident hand joints or zero extent fall back to upstream.
     """
     xy = np.asarray(wb_xy, dtype=np.float64)
     sc = np.asarray(wb_score, dtype=np.float64).copy()
@@ -759,6 +771,9 @@ def unisign_part_features(wb_xy, wb_score, thr=_US_THR):
             for p_ in (left, right, face):
                 p_[..., :2] = p_[..., :2] / scale
                 parts.append(p_)
+            if hand_ratio is not None:
+                for p_ in (left, right):
+                    _rescale_hand_per_frame(p_, hand_ratio, thr)
             o = 0
             for p_ in parts:
                 p_ = np.clip(p_, -1, 1)              # clips score too, as upstream
@@ -766,6 +781,25 @@ def unisign_part_features(wb_xy, wb_score, thr=_US_THR):
                 out[:, o:o + p_.shape[1]] = p_
                 o += p_.shape[1]
     return out.reshape(T, UNISIGN_DIM).astype(np.float32)
+
+
+def _hand_extent(hand, thr):
+    """Per-frame extent (larger side) of confident joints; hand is (T, 21, 3)."""
+    ok = hand[..., 2] > thr                                   # (T, 21)
+    xy = np.where(ok[..., None], hand[..., :2], np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)       # all-NaN frames
+        ext = np.nanmax(np.nanmax(xy, axis=1) - np.nanmin(xy, axis=1), axis=-1)
+    ext[ok.sum(axis=1) < 2] = np.nan
+    return ext                                               # (T,), NaN = unusable
+
+
+def _rescale_hand_per_frame(hand, ratio, thr):
+    """In place: scale each frame so the hand's extent equals `ratio` body-units."""
+    ext = _hand_extent(hand, thr)
+    usable = np.isfinite(ext) & (ext > 1e-6)
+    factor = np.where(usable, ratio / np.where(usable, ext, 1.0), 1.0)
+    hand[..., :2] *= factor[:, None, None]
 
 
 def unpack_unisign_parts(kps):

@@ -117,7 +117,7 @@ def breakdown(rows):
 
 def build_loader(root, manifest_path, use_enriched, signspace, downsample,
                  tokenizer, batch_size, real_wrists=False, score_quantiles=None,
-                 unisign_preprocess=False):
+                 unisign_preprocess=False, unisign_hand_scale=None):
     with open(manifest_path) as fh:
         manifest = {m['clip_id']: m for m in json.load(fh)}
     parts, meta = [], []
@@ -127,6 +127,7 @@ def build_loader(root, manifest_path, use_enriched, signspace, downsample,
                              use_enriched=use_enriched, signspace=signspace,
                              real_wrists=real_wrists, score_quantiles=score_quantiles,
                              unisign_preprocess=unisign_preprocess,
+                             unisign_hand_scale=unisign_hand_scale,
                              downsample_every=downsample)
         parts.append(ds)
     indices, offset = [], 0
@@ -165,8 +166,30 @@ def load_weights(model, path, device):
     else:
         sys.exit(f"[fatal] {path} has no mT5 weights")
     info = {k: ckpt.get(k) for k in ('epoch', 'source', 'use_lora')}
+    info['run_args'] = ckpt.get('run_args')
     del ckpt
     return info
+
+
+# Input-pipeline flags that change what the encoder sees. A checkpoint scored
+# with a different setting than it trained with gets silently wrong inputs.
+_INPUT_FLAGS = ('use_enriched', 'signspace', 'real_wrists', 'score_quantiles',
+                'unisign_preprocess', 'unisign_hand_scale', 'block_padding_mask')
+
+
+def check_run_args(info, args, path):
+    ra = info.get('run_args') or {}
+    bad = []
+    for k in _INPUT_FLAGS:
+        if k not in ra:
+            continue                      # older checkpoints predate the flag
+        trained, scoring = ra[k], getattr(args, k)
+        if k in ('score_quantiles', 'unisign_hand_scale'):
+            trained, scoring = bool(trained), bool(scoring)
+        if bool(trained) != bool(scoring):
+            bad.append(f"{k}: trained={ra[k]!r} scoring={getattr(args, k)!r}")
+    if bad:
+        sys.exit(f"[fatal] {path} input pipeline mismatch -- " + '; '.join(bad))
 
 
 def run(model, loader, meta, device, decode):
@@ -232,6 +255,7 @@ def main():
     ap.add_argument('--real-wrists', action='store_true')
     ap.add_argument('--score-quantiles', default=None)
     ap.add_argument('--unisign-preprocess', action='store_true')
+    ap.add_argument('--unisign-hand-scale', default=None)
     ap.add_argument('--batch-size', type=int, default=16)
     ap.add_argument('--out', default='output/e1')
     ap.add_argument('--sweep-on', default=None,
@@ -262,12 +286,14 @@ def main():
         encoder = KeypointEncoder(hidden_dim=cfg['model']['d_model'], input_dim=input_dim,
                                   block_padding_mask=args.block_padding_mask,
                                   real_wrists=args.real_wrists,
-                                score_quantiles=args.score_quantiles,
-                                unisign_preprocess=args.unisign_preprocess)
+                                  unisign_input=args.unisign_preprocess)
         model = UniSignMT5(encoder=encoder, lang='Kazakh').to(device)
     loader, meta = build_loader(root, manifest, args.use_enriched, args.signspace,
                                 downsample, model.mt5_tokenizer, args.batch_size,
-                                real_wrists=args.real_wrists)
+                                real_wrists=args.real_wrists,
+                                score_quantiles=args.score_quantiles,
+                                unisign_preprocess=args.unisign_preprocess,
+                                unisign_hand_scale=args.unisign_hand_scale)
     log(f"selection: {len(meta)} clips from {manifest}  "
         f"{dict(collections.Counter(m['source'] for m in meta))}")
 
@@ -280,6 +306,7 @@ def main():
     for path, label, roots in specs:
         log(f"=== {label}: {path}")
         info = load_weights(model, path, device)
+        check_run_args(info, args, path)
         seen = train_videos(roots)
         res, rows = evaluate(label, model, loader, meta, device, default_decode,
                              seen, args.out)

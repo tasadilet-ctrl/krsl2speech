@@ -73,6 +73,7 @@ class AsanDataset(Dataset):
         real_wrists=False,       # E2: real wrist bones, see forearm_offsets
         score_quantiles=None,    # E2: path to train-fitted score table
         unisign_preprocess=False,  # E3 arm B: exact upstream Uni-Sign inputs
+        unisign_hand_scale=None,   # E3 arm D: path to fit_hand_ratio.py output
         min_frames=25,           # skip clips shorter than this (pre-downsample)
         max_frames=1000,         # truncate after downsampling
         downsample_every=1,
@@ -97,6 +98,12 @@ class AsanDataset(Dataset):
         self.signspace = signspace
         self.real_wrists = real_wrists
         self.unisign_preprocess = unisign_preprocess
+        self._hand_ratio = None
+        if unisign_hand_scale:
+            if not unisign_preprocess:
+                raise ValueError("unisign_hand_scale requires unisign_preprocess")
+            with open(os.path.expanduser(unisign_hand_scale)) as fh:
+                self._hand_ratio = float(json.load(fh)['ratio'])
         if unisign_preprocess and (use_enriched or signspace or real_wrists or score_quantiles):
             raise ValueError(
                 "unisign_preprocess reproduces upstream Uni-Sign inputs exactly and "
@@ -184,6 +191,7 @@ class AsanDataset(Dataset):
         enrich_tag += " real_wrists" if real_wrists else ""
         enrich_tag += " score_quantiles" if score_quantiles else ""
         enrich_tag += " unisign_preprocess" if unisign_preprocess else ""
+        enrich_tag += f" hand_ratio={self._hand_ratio:.4f}" if self._hand_ratio else ""
         print(f"[{self.ds_name}] split={split}{enrich_tag} Total: "
               f"{len(self.clips)} clips ({n_filtered} filtered), "
               f"downsample={downsample_every}x")
@@ -265,7 +273,8 @@ class AsanDataset(Dataset):
         # above (downsample, truncation) is shared with the other arms, so the
         # arms differ only in spatial preprocessing.
         if self.unisign_preprocess:
-            kps = unisign_part_features(wb, sc)            # NaN in wb => score 0
+            kps = unisign_part_features(wb, sc,            # NaN in wb => score 0
+                                        hand_ratio=self._hand_ratio)
             return {
                 'keypoints': torch.tensor(kps, dtype=torch.float32),
                 'prosody': None, 'rgb': None, 'hand_crops': None,

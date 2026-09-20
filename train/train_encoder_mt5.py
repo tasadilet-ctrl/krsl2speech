@@ -272,7 +272,7 @@ class UniSignMT5(nn.Module):
       5. MT5 generates text autoregressively
     """
 
-    def __init__(self, encoder, mt5_path=MT5_PATH, lang="Kazakh",
+    def __init__(self, encoder, mt5_path=MT5_PATH, lang="Kazakh", align_dim=None,
                  masked_pose_dim=None, ctc_vocab_size=None,
                  use_pgf=False, pgf_p_samp=0.5, prosody_aux_dim=None):
         """
@@ -319,6 +319,16 @@ class UniSignMT5(nn.Module):
         # shared direction across clips — cross-attention saturates on the
         # constant and the decoder degenerates to corpus-prior loops.
         self.pose_norm = nn.LayerNorm(encoder.hidden_dim)
+
+        # E5 pose-text alignment heads (train-only; unused at inference).
+        # Deliberately NOT saved in checkpoints -- see save logic.
+        self.align_dim = align_dim
+        self.align_pose_head = None
+        if align_dim:
+            self.align_pose_head = nn.Linear(encoder.hidden_dim, align_dim)
+            self.align_text_head = nn.Linear(encoder.hidden_dim, align_dim)
+            # log(1/0.07), the CLIP initialisation; learnable and clamped in forward.
+            self.align_logit_scale = nn.Parameter(torch.tensor(2.6593))
 
         self.masked_pose_decoder = None
         if masked_pose_dim is not None:
@@ -475,10 +485,56 @@ class UniSignMT5(nn.Module):
 
         return hook
 
+    def _alignment_loss(self, pose_emb, kps, input_lengths, text_vecs,
+                        neg_vecs=None, neg_mask=None):
+        """
+        InfoNCE between a clip's pooled pose embedding and its frozen text-teacher
+        vector (scripts/cache_text_embeddings.py).
+
+        Why this exists: E3 showed training is bimodal -- the decoder either starts
+        using the pose input ("takeoff") or regresses to the corpus's most frequent
+        sentence. Only 1 of 8 runs took off. Cross-entropy alone never requires the
+        encoder to carry information, so this adds a term that is only minimised by
+        pose representations that identify their own transcript.
+
+        Pose side: mean over VALID frames only (padding would otherwise dilute
+        short clips differently depending on their batch).
+        Negatives: in-batch plus optional rows sampled from the cached table, so the
+        count is not capped by the batch size of 8. `neg_mask` marks sampled
+        negatives whose text is identical to the positive (2.6% of references repeat)
+        -- those are masked out instead of being pushed apart.
+        """
+        B, T, _ = pose_emb.shape
+        if input_lengths is not None:
+            valid = (torch.arange(T, device=pose_emb.device)[None, :]
+                     < input_lengths.to(pose_emb.device)[:, None]).unsqueeze(-1)
+        else:
+            valid = (kps.abs().sum(-1, keepdim=True) > 0)
+        v = valid.to(pose_emb.dtype)
+        pooled = (pose_emb * v).sum(1) / v.sum(1).clamp(min=1.0)          # (B, D)
+
+        zp = F.normalize(self.align_pose_head(pooled), dim=-1)            # (B, d)
+        zt = F.normalize(self.align_text_head(text_vecs.to(pooled.dtype)), dim=-1)
+        scale = self.align_logit_scale.clamp(max=4.6052).exp()            # <= 100
+
+        logits = scale * zp @ zt.t()                                      # (B, B)
+        if neg_vecs is not None and neg_vecs.numel():
+            zn = F.normalize(self.align_text_head(neg_vecs.to(pooled.dtype)), dim=-1)
+            extra = scale * zp @ zn.t()                                   # (B, K)
+            if neg_mask is not None:
+                extra = extra.masked_fill(neg_mask, float('-inf'))
+            logits = torch.cat([logits, extra], dim=1)                    # (B, B+K)
+
+        target = torch.arange(B, device=logits.device)
+        # Pose->text only: the text side is frozen and cached, so the symmetric
+        # text->pose direction would just train the text head against itself.
+        return F.cross_entropy(logits, target)
+
     def forward(self, kps, label_ids, label_attn_mask, input_lengths=None,
                 kps_target=None, frame_mask=None,
                 hand_crops=None, hand_ref=None, hand_valid=None, hand_score=None,
-                prosody_target=None):
+                prosody_target=None, align_text=None, align_negatives=None,
+                align_neg_mask=None):
         """
         Training forward pass.
 
@@ -505,6 +561,7 @@ class UniSignMT5(nn.Module):
             mse_loss: masked-pose reconstruction loss (or None)
             ctc_log_probs: (T, B, V+1) log-probs for CTC (or None)
             prosody_aux_loss: prosody-supervision loss (or None)
+            align_loss: pose-text InfoNCE (or None). See _alignment_loss.
         """
         B = kps.size(0)
 
@@ -521,6 +578,13 @@ class UniSignMT5(nn.Module):
         pgf_hook = self._make_pgf_hook(hand_crops, hand_ref, hand_valid, hand_score, input_lengths)
         pose_emb = self.pose_norm(self.encoder(
             kps, input_lengths=input_lengths, hand_fusion_fn=pgf_hook))  # (B, T, 768)
+
+        # E5: pose-text alignment on the pooled pose embedding.
+        align_loss = None
+        if align_text is not None and self.align_pose_head is not None:
+            align_loss = self._alignment_loss(pose_emb, kps, input_lengths,
+                                              align_text, align_negatives,
+                                              align_neg_mask)
 
         # Prefix embeds: re-embed each forward for grad correctness
         # (~10 token lookup is free, avoids backward-through-cached-graph bugs)
@@ -583,7 +647,7 @@ class UniSignMT5(nn.Module):
             else:
                 prosody_aux_loss = prosody_pred.sum() * 0.0
 
-        return out.loss, mse_loss, ctc_log_probs, prosody_aux_loss
+        return out.loss, mse_loss, ctc_log_probs, prosody_aux_loss, align_loss
 
     def generate(self, kps, input_lengths=None, max_new_tokens=128, num_beams=4,
                 hand_crops=None, hand_ref=None, hand_valid=None, hand_score=None,
@@ -645,7 +709,9 @@ class MT5Trainer:
                  use_enriched=False, signspace=False,
                  selection_manifest=None, block_padding_mask=False,
                  real_wrists=False, score_quantiles=None,
-                 unisign_preprocess=False,
+                 unisign_preprocess=False, unisign_hand_scale=None,
+                 align_cache=None, align_weight=0.0, align_negatives=256,
+                 align_dim=256,
                  masked_pose_ratio=0.0, overfit_n=0,
                  ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
                  grad_accum=None, encoder_lr=None,
@@ -666,6 +732,22 @@ class MT5Trainer:
         self.real_wrists = real_wrists
         self.score_quantiles = score_quantiles
         self.unisign_preprocess = unisign_preprocess
+        self.unisign_hand_scale = unisign_hand_scale
+        self.align_weight = align_weight
+        self.align_negatives = align_negatives
+        self._align_running = 0.0
+        self._align_vecs = self._align_hash = self._align_index = None
+        if align_cache:
+            import numpy as _np
+            z = _np.load(os.path.expanduser(align_cache), allow_pickle=True)
+            self._align_vecs = torch.from_numpy(z['vecs'].astype('float32'))
+            self._align_hash = torch.from_numpy(z['text_hash'])
+            self._align_index = {c: i for i, c in enumerate(z['clip_ids'].tolist())}
+            log(f"[Align] text teacher {z['teacher']}: {len(self._align_index)} clips, "
+                f"dim {self._align_vecs.shape[1]}, weight {align_weight}, "
+                f"{align_negatives} sampled negatives")
+        elif align_weight > 0:
+            raise ValueError("--align-weight needs --align-cache")
         self.selection_manifest = selection_manifest
         self.gen_loader = None
         self._gen_target = None
@@ -691,6 +773,9 @@ class MT5Trainer:
             real_wrists=real_wrists,
             score_quantiles=score_quantiles,
             unisign_preprocess=unisign_preprocess,
+            unisign_hand_scale=unisign_hand_scale,
+            align_weight=align_weight, align_negatives=align_negatives,
+            align_dim=align_dim if align_weight > 0 else None,
             masked_pose_ratio=masked_pose_ratio,
             ctc_weight=ctc_weight, ctc_vocab_size=ctc_vocab_size,
             freeze_spatial=freeze_spatial, use_lora=use_lora,
@@ -747,6 +832,7 @@ class MT5Trainer:
         # that (a) DDP keeps it in sync across ranks and (b) the aux loss
         # backprops into the encoder.
         self.model = UniSignMT5(
+            align_dim=align_dim if align_weight > 0 else None,
             encoder=self.encoder, lang="Kazakh",
             masked_pose_dim=input_dim if masked_pose_ratio > 0 else None,
             ctc_vocab_size=self.ctc_vocab_size if self.ctc_tokenizer else None,
@@ -1133,6 +1219,7 @@ class MT5Trainer:
                 real_wrists=self.real_wrists,
                 score_quantiles=self.score_quantiles,
                 unisign_preprocess=self.unisign_preprocess,
+                unisign_hand_scale=self.unisign_hand_scale,
                 skip_low_quality=asan_cfg.get('skip_low_quality', True),
                 min_hand_cov=asan_cfg.get('min_hand_cov', 0.0),
                 # Hand crops are only extracted for asan-dataset (khabar_kz/
@@ -1287,12 +1374,44 @@ class MT5Trainer:
 
         return train_loader, val_loader
 
+    def _align_batch(self, batch):
+        """
+        Per-batch tensors for the E5 alignment loss, or (None, None, None).
+
+        Looks up each clip's frozen text-teacher vector by clip_id (never by
+        batch position: SimpleCollator sorts by length and drops invalid
+        samples). Then samples extra negatives from the cached table, masking
+        any whose normalized text equals the positive's -- 2.6% of references
+        are exact duplicates of another clip's, and those are not negatives.
+        """
+        if self._align_vecs is None or self.align_weight <= 0:
+            return None, None, None
+        ids = batch.get('clip_ids')
+        if not ids:
+            return None, None, None
+        rows = [self._align_index.get(c) for c in ids]
+        if any(r is None for r in rows):                 # clip absent from cache
+            return None, None, None
+        idx = torch.tensor(rows, dtype=torch.long)
+        text = self._align_vecs[idx].to(self.device, non_blocking=True).float()
+
+        negs = neg_mask = None
+        if self.align_negatives > 0:
+            k = min(self.align_negatives, self._align_vecs.shape[0])
+            nidx = torch.randint(0, self._align_vecs.shape[0], (k,))
+            negs = self._align_vecs[nidx].to(self.device, non_blocking=True).float()
+            pos_h = self._align_hash[idx].to(self.device)      # (B,)
+            neg_h = self._align_hash[nidx].to(self.device)     # (K,)
+            neg_mask = pos_h[:, None] == neg_h[None, :]        # (B, K) true = same text
+        return text, negs, neg_mask
+
     def train_epoch(self, train_loader, epoch):
         self.model.train()
         total_loss = 0
         total_mse = 0
         self._ctc_running = 0.0
         self._prosody_aux_running = 0.0
+        self._align_running = 0.0
         num_batches = 0
         pending = 0  # batches accumulated since the last optimizer step
         self.optimizer.zero_grad()
@@ -1331,7 +1450,8 @@ class MT5Trainer:
                 kps_train = torch.where(mask, torch.zeros_like(kps), kps)
 
             # Forward pass (CE + optional aux losses, single encoder pass)
-            loss, mse_loss, ctc_log_probs, prosody_aux_loss = self.model(
+            align_text, align_negs, align_neg_mask = self._align_batch(batch)
+            loss, mse_loss, ctc_log_probs, prosody_aux_loss, align_loss = self.model(
                 kps_train, label_ids, label_attn,
                 input_lengths=input_lengths,
                 kps_target=kps if mask is not None else None,
@@ -1339,7 +1459,14 @@ class MT5Trainer:
                 hand_crops=hand_crops, hand_ref=hand_ref,
                 hand_valid=hand_valid, hand_score=hand_score,
                 prosody_target=prosody_target,
+                align_text=align_text, align_negatives=align_negs,
+                align_neg_mask=align_neg_mask,
             )
+            if align_loss is None:
+                align_loss = torch.tensor(0.0, device=self.device)
+            elif self.align_weight > 0:
+                loss = loss + self.align_weight * align_loss
+            self._align_running += float(align_loss.detach())
             if mse_loss is None:
                 mse_loss = torch.tensor(0.0, device=self.device)
             else:
@@ -1406,7 +1533,9 @@ class MT5Trainer:
                      + (f" | CTC: {self._ctc_running / num_batches:.4f}"
                         if self._ctc_running > 0 else "")
                      + (f" | ProsAux: {self._prosody_aux_running / num_batches:.4f}"
-                        if self._prosody_aux_running > 0 else ""))
+                        if self._prosody_aux_running > 0 else "")
+                     + (f" | Align: {self._align_running / num_batches:.4f}"
+                        if self._align_running > 0 else ""))
 
         # Flush a leftover partial accumulation window at epoch end
         if pending > 0:
@@ -1458,7 +1587,7 @@ class MT5Trainer:
             hand_score = batch['hand_score'].to(self.device) if batch.get('hand_score') is not None else None
             texts = batch['texts']
 
-            loss, _, _, _ = self.model(kps, label_ids, label_attn,
+            loss, _, _, _, _ = self.model(kps, label_ids, label_attn,
                                     input_lengths=input_lengths,
                                     hand_crops=hand_crops, hand_ref=hand_ref,
                                     hand_valid=hand_valid, hand_score=hand_score)
@@ -1750,6 +1879,24 @@ def main():
                              'nose-relative face, (x,y,score) with score<=0.3 '
                              'masked). Input dim 207. Exclusive with '
                              '--use-enriched/--signspace/--real-wrists/--score-quantiles.')
+    parser.add_argument('--align-cache', default=None,
+                        help='E5: frozen text-teacher vectors from '
+                             'scripts/cache_text_embeddings.py.')
+    parser.add_argument('--align-weight', type=float, default=0.0,
+                        help='E5: weight of the pose-text InfoNCE added to CE. '
+                             '0 disables (default). Targets the bimodal failure '
+                             'found in E3, where 7 of 8 runs never used the pose '
+                             'input and collapsed to the corpus prior.')
+    parser.add_argument('--align-negatives', type=int, default=256,
+                        help='E5: negatives sampled from the cached table per '
+                             'step, on top of the 7 in-batch ones.')
+    parser.add_argument('--align-dim', type=int, default=256,
+                        help='E5: projection dim for the shared pose/text space.')
+    parser.add_argument('--unisign-hand-scale', default=None,
+                        help='E3 arm D: hand_ratio.json from scripts/fit_hand_ratio.py. '
+                             'Rescales each hand per frame to the train-median '
+                             'hand size in upstream body-box units. Requires '
+                             '--unisign-preprocess.')
     parser.add_argument('--seed', type=int, default=0,
                         help='Seeds python, numpy and torch (CPU+CUDA). cuDNN '
                              'kernels remain nondeterministic.')
@@ -1871,6 +2018,8 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
+    if args.unisign_hand_scale and not args.unisign_preprocess:
+        parser.error('--unisign-hand-scale requires --unisign-preprocess')
     if args.unisign_preprocess and (args.use_enriched or args.signspace
                                     or args.real_wrists or args.score_quantiles):
         parser.error('--unisign-preprocess is exclusive with --use-enriched, '
@@ -1920,6 +2069,11 @@ def main():
         real_wrists=args.real_wrists,
         score_quantiles=args.score_quantiles,
         unisign_preprocess=args.unisign_preprocess,
+        unisign_hand_scale=args.unisign_hand_scale,
+        align_dim=args.align_dim,
+        align_negatives=args.align_negatives,
+        align_weight=args.align_weight,
+        align_cache=args.align_cache,
         masked_pose_ratio=args.masked_pose_ratio,
         overfit_n=args.overfit_n,
         ctc_weight=args.ctc_weight,
