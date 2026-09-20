@@ -1405,6 +1405,8 @@ class MT5Trainer:
             neg_mask = pos_h[:, None] == neg_h[None, :]        # (B, K) true = same text
         return text, negs, neg_mask
 
+    _align_epoch_mean = 0.0
+
     def train_epoch(self, train_loader, epoch):
         self.model.train()
         total_loss = 0
@@ -1554,6 +1556,8 @@ class MT5Trainer:
             dist.all_reduce(count_tensor, dist.ReduceOp.SUM)
             total_loss = loss_tensor.item()
             num_batches = count_tensor.item()
+
+        self._align_epoch_mean = self._align_running / max(num_batches, 1)
 
         return total_loss / max(num_batches, 1)
 
@@ -1795,7 +1799,9 @@ class MT5Trainer:
                   f"ROUGE-1/2/L: {metrics['rouge1']:.3f}/{metrics['rouge2']:.3f}/"
                   f"{metrics['rougeL']:.3f} | BERTScore: {metrics['bertscore_f1']:.4f} | "
                   f"LR_enc: {lr_enc:.6f} | LR_mt5: {lr_mt5:.6f} | "
-                  f"Time: {epoch_time:.1f}s")
+                + (f"Align: {self._align_epoch_mean:.4f} | "
+                   if self._align_epoch_mean else "")
+                + f"Time: {epoch_time:.1f}s")
 
             # ---- Best-checkpoint selection ----
             # Selects on --select-metric (default WER), NOT val CE. On this
