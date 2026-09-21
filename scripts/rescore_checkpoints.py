@@ -16,6 +16,11 @@ are flagged and metrics are reported twice:
   * clean    -- only clips from videos that checkpoint never trained on
 Compare checkpoints on `clean`, and on the common clean subset in summary.json.
 
+Every declared root must exist and carry a train split for every source, or
+the script exits before loading anything. A checkpoint that trained on no
+KRSL data declares the root `none`, which is the only way to report zero
+contamination.
+
 Usage (one or more --ckpt, each  path=label:root[,root...]):
   PYTHONPATH=. python scripts/rescore_checkpoints.py \
     --root ~/asan_canonical --use-enriched --out output/e1 \
@@ -60,15 +65,60 @@ def video_id(entry):
     return m.group(1) if m else None
 
 
+# Declares a checkpoint that trained on no KRSL data at all (e.g. a base
+# Uni-Sign + base mT5 init). The only way to get an empty contamination set.
+NO_TRAIN_ROOTS = 'none'
+
+
+def train_split_paths(root):
+    """{source: train.json path} for a declared training root, or exit.
+
+    Every declared root must exist and carry a train split for every source.
+    These used to be skipped with `if os.path.exists(p)`, so a mistyped root
+    produced an empty set and every clip was reported as uncontaminated: the
+    check could not detect its own misconfiguration. A root missing a single
+    source was worse, because it under-reported only that source and still
+    looked plausible.
+    """
+    path = os.path.expanduser(root)
+    if not os.path.isdir(path):
+        sys.exit(f"[fatal] training root {root!r} does not exist ({path}). "
+                 f"A checkpoint trained on no KRSL data declares "
+                 f"{NO_TRAIN_ROOTS!r} instead.")
+    splits = {src: os.path.join(path, src, 'annotations', 'kz', 'train.json')
+              for src in SOURCES}
+    missing = [src for src, p in splits.items() if not os.path.exists(p)]
+    if missing:
+        sys.exit(f"[fatal] training root {root!r} has no train split for "
+                 f"{missing}; contamination for those sources would be "
+                 f"silently under-reported")
+    return splits
+
+
+def validate_roots(roots):
+    """Fail fast on a bad root list, before any checkpoint is loaded."""
+    if NO_TRAIN_ROOTS in roots and roots != [NO_TRAIN_ROOTS]:
+        sys.exit(f"[fatal] {NO_TRAIN_ROOTS!r} cannot be combined with other "
+                 f"training roots: {roots}")
+    if roots != [NO_TRAIN_ROOTS]:
+        for root in roots:
+            train_split_paths(root)
+
+
 def train_videos(roots):
     """(source, video_id) pairs a checkpoint trained on, from its roots' TRAIN splits."""
+    validate_roots(roots)
+    if roots == [NO_TRAIN_ROOTS]:
+        return set()
     seen = set()
     for root in roots:
-        root = os.path.expanduser(root)
-        for src in SOURCES:
-            p = os.path.join(root, src, 'annotations', 'kz', 'train.json')
-            if os.path.exists(p):
-                seen |= {(src, video_id(e)) for e in json.load(open(p))}
+        from_root = set()
+        for src, p in train_split_paths(root).items():
+            from_root |= {(src, video_id(e)) for e in json.load(open(p))}
+        if not from_root:
+            sys.exit(f"[fatal] training root {root!r} has train splits but "
+                     f"they list no videos")
+        seen |= from_root
     return seen
 
 
@@ -276,7 +326,11 @@ def main():
     for spec in args.ckpt:
         path, rest = spec.split('=', 1)
         label, roots = rest.split(':', 1)
-        specs.append((os.path.expanduser(path), label, roots.split(',')))
+        roots = roots.split(',')
+        # Checked here, not per checkpoint: a typo in the last --ckpt would
+        # otherwise surface only after every earlier checkpoint was scored.
+        validate_roots(roots)
+        specs.append((os.path.expanduser(path), label, roots))
     if args.sweep_on not in (None, 'auto') and args.sweep_on not in {s[1] for s in specs}:
         sys.exit(f"[fatal] --sweep-on {args.sweep_on!r} is not a checkpoint label")
 
