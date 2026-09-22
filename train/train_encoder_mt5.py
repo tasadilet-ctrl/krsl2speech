@@ -260,6 +260,36 @@ def log(*args, **kwargs):
 # MT5 Wrapper Model
 # ============================================================
 
+def token_alignment_scores(pose_z, pose_valid, text_z, text_valid, chunk=32):
+    """
+    E6: token-level pose-text similarity, (B, N).
+
+    For clip b and text n: the mean, over n's content tokens, of each token's
+    best cosine against any of b's valid frames. Every word has to be found
+    somewhere in the video, in any order -- sign order does not follow Kazakh
+    word order, which is why this is not CTC, and why the frame side takes a
+    max rather than a position-aligned match.
+
+    pose_z (B, T, d) and text_z (N, L, d) must already be L2-normalised.
+    pose_valid (B, T) / text_valid (N, L) are bool. Scored in chunks of texts:
+    the full (B, N, L, T) similarity is up to ~1 GB at N=264, and only its max
+    over frames is needed. `.max(dim).values` keeps indices for backward, not
+    the similarity tensor itself.
+    """
+    # A clip with no valid frame would otherwise score -inf against every text;
+    # fall back to its raw frames, as E5's pooled mean does via clamp(min=1).
+    pose_valid = pose_valid | ~pose_valid.any(1, keepdim=True)
+    frame_pad = ~pose_valid[:, None, None, :]                       # (B, 1, 1, T)
+    floor = torch.finfo(pose_z.dtype).min
+    out = []
+    for s in range(0, text_z.size(0), chunk):
+        sim = torch.einsum('btd,nld->bnlt', pose_z, text_z[s:s + chunk])
+        best = sim.masked_fill(frame_pad, floor).max(dim=-1).values  # (B, n, L)
+        w = text_valid[s:s + chunk].to(best.dtype)[None]             # (1, n, L)
+        out.append((best * w).sum(-1) / w.sum(-1).clamp(min=1.0))
+    return torch.cat(out, dim=1)
+
+
 class UniSignMT5(nn.Module):
     """
     Uni-Sign + MT5 wrapper.
@@ -530,11 +560,42 @@ class UniSignMT5(nn.Module):
         # text->pose direction would just train the text head against itself.
         return F.cross_entropy(logits, target)
 
+    def _token_alignment_loss(self, pose_emb, kps, input_lengths, tokens,
+                              token_mask, neg_mask=None):
+        """
+        E6: InfoNCE over token_alignment_scores, otherwise identical to E5.
+
+        E5 pooled both sides to one vector and the align loss fell far below
+        chance on every seed while the decoder still ignored the encoder.
+        This removes the pooling and nothing else: same heads, same frozen
+        base-mT5 teacher (unpooled), same weight, negatives and temperature.
+
+        tokens (B+K, L, D): the batch's own texts first, then K sampled
+        negatives; token_mask (B+K, L); neg_mask (B, K) marks sampled texts
+        identical to the positive, as in E5.
+        """
+        B, T, _ = pose_emb.shape
+        if input_lengths is not None:
+            valid = (torch.arange(T, device=pose_emb.device)[None, :]
+                     < input_lengths.to(pose_emb.device)[:, None])
+        else:
+            valid = kps.abs().sum(-1) > 0
+        zp = F.normalize(self.align_pose_head(pose_emb), dim=-1)          # (B, T, d)
+        zt = F.normalize(self.align_text_head(tokens.to(pose_emb.dtype)), dim=-1)
+        scale = self.align_logit_scale.clamp(max=4.6052).exp()            # <= 100
+        logits = scale * token_alignment_scores(zp, valid, zt, token_mask)  # (B, B+K)
+        if neg_mask is not None and logits.size(1) > B:
+            extra = logits[:, B:].masked_fill(neg_mask, float('-inf'))
+            logits = torch.cat([logits[:, :B], extra], dim=1)
+        target = torch.arange(B, device=logits.device)
+        # Pose->text only, as in E5: the text side is frozen.
+        return F.cross_entropy(logits, target)
+
     def forward(self, kps, label_ids, label_attn_mask, input_lengths=None,
                 kps_target=None, frame_mask=None,
                 hand_crops=None, hand_ref=None, hand_valid=None, hand_score=None,
                 prosody_target=None, align_text=None, align_negatives=None,
-                align_neg_mask=None):
+                align_neg_mask=None, align_tokens=None, align_token_mask=None):
         """
         Training forward pass.
 
@@ -581,7 +642,12 @@ class UniSignMT5(nn.Module):
 
         # E5: pose-text alignment on the pooled pose embedding.
         align_loss = None
-        if align_text is not None and self.align_pose_head is not None:
+        if align_tokens is not None and self.align_pose_head is not None:
+            # E6: token-level variant.
+            align_loss = self._token_alignment_loss(pose_emb, kps, input_lengths,
+                                                    align_tokens, align_token_mask,
+                                                    align_neg_mask)
+        elif align_text is not None and self.align_pose_head is not None:
             align_loss = self._alignment_loss(pose_emb, kps, input_lengths,
                                               align_text, align_negatives,
                                               align_neg_mask)
@@ -711,7 +777,7 @@ class MT5Trainer:
                  real_wrists=False, score_quantiles=None,
                  unisign_preprocess=False, unisign_hand_scale=None,
                  align_cache=None, align_weight=0.0, align_negatives=256,
-                 align_dim=256,
+                 align_dim=256, align_mode='seq',
                  masked_pose_ratio=0.0, overfit_n=0,
                  ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
                  grad_accum=None, encoder_lr=None,
@@ -737,9 +803,38 @@ class MT5Trainer:
         self.align_negatives = align_negatives
         self._align_running = 0.0
         self._align_vecs = self._align_hash = self._align_index = None
+        self._align_tokens = self._align_offsets = None
+        if align_mode not in ('seq', 'token'):
+            raise ValueError(f"--align-mode must be seq or token, got {align_mode!r}")
+        self.align_mode = align_mode
         if align_cache:
             import numpy as _np
-            z = _np.load(os.path.expanduser(align_cache), allow_pickle=True)
+            cache_path = os.path.expanduser(align_cache)
+            z = _np.load(cache_path, allow_pickle=True)
+            is_token_cache = 'offsets' in z.files
+            # A mismatch would silently train the wrong objective (or none).
+            if align_mode == 'token' and not is_token_cache:
+                raise ValueError(f"--align-mode token needs a per-token cache "
+                                 f"(cache_text_embeddings.py --per-token); "
+                                 f"{align_cache} is a pooled one")
+            if align_mode == 'seq' and is_token_cache:
+                raise ValueError(f"{align_cache} is a per-token cache; "
+                                 f"pass --align-mode token")
+        if align_cache and align_mode == 'token':
+            tok_file = os.path.join(os.path.dirname(cache_path), str(z['tokens_file']))
+            # Memory-mapped: 6 GB of fp16 rows, read ~16k per step.
+            self._align_tokens = _np.load(tok_file, mmap_mode='r')
+            self._align_offsets = z['offsets']
+            self._align_hash = torch.from_numpy(z['text_hash'])
+            self._align_index = {c: i for i, c in enumerate(z['clip_ids'].tolist())}
+            if self._align_offsets[-1] != self._align_tokens.shape[0]:
+                raise ValueError(f"{tok_file} has {self._align_tokens.shape[0]} rows, "
+                                 f"index expects {self._align_offsets[-1]}")
+            log(f"[Align] E6 token-level, teacher {z['teacher']}: "
+                f"{len(self._align_index)} clips, {self._align_tokens.shape[0]:,} "
+                f"token rows, dim {self._align_tokens.shape[1]}, weight {align_weight}, "
+                f"{align_negatives} sampled negatives")
+        elif align_cache:
             self._align_vecs = torch.from_numpy(z['vecs'].astype('float32'))
             self._align_hash = torch.from_numpy(z['text_hash'])
             self._align_index = {c: i for i, c in enumerate(z['clip_ids'].tolist())}
@@ -1439,6 +1534,50 @@ class MT5Trainer:
             neg_mask = pos_h[:, None] == neg_h[None, :]        # (B, K) true = same text
         return text, negs, neg_mask
 
+    def _align_token_batch(self, batch):
+        """
+        Per-batch tensors for the E6 token-level loss, or (None, None, None).
+
+        Same clip-id lookup, negative sampling and duplicate-text masking as
+        _align_batch, so the two differ only in what each row holds: the
+        clip's per-token teacher states, padded to the longest text in the
+        batch+negatives, instead of their mean.
+        Returns tokens (B+K, L, D), token_mask (B+K, L), neg_mask (B, K).
+        """
+        if self._align_tokens is None or self.align_weight <= 0:
+            return None, None, None
+        ids = batch.get('clip_ids')
+        if not ids:
+            return None, None, None
+        rows = [self._align_index.get(c) for c in ids]
+        if any(r is None for r in rows):                 # clip absent from cache
+            return None, None, None
+        idx = torch.tensor(rows, dtype=torch.long)
+        n_clips = len(self._align_offsets) - 1
+
+        neg_mask, nidx = None, torch.empty(0, dtype=torch.long)
+        if self.align_negatives > 0:
+            k = min(self.align_negatives, n_clips)
+            nidx = torch.randint(0, n_clips, (k,))
+            pos_h = self._align_hash[idx].to(self.device)      # (B,)
+            neg_h = self._align_hash[nidx].to(self.device)     # (K,)
+            neg_mask = pos_h[:, None] == neg_h[None, :]        # (B, K) true = same text
+
+        off = self._align_offsets
+        all_rows = idx.tolist() + nidx.tolist()
+        spans = [(int(off[r]), int(off[r + 1])) for r in all_rows]
+        L = max(b - a for a, b in spans)
+        D = self._align_tokens.shape[1]
+        import numpy as _np          # this module only imports numpy locally
+        buf = _np.zeros((len(spans), L, D), dtype=_np.float16)
+        mask = _np.zeros((len(spans), L), dtype=bool)
+        for i, (a, b) in enumerate(spans):
+            buf[i, :b - a] = self._align_tokens[a:b]
+            mask[i, :b - a] = True
+        tokens = torch.from_numpy(buf).to(self.device, non_blocking=True).float()
+        token_mask = torch.from_numpy(mask).to(self.device, non_blocking=True)
+        return tokens, token_mask, neg_mask
+
     _align_epoch_mean = 0.0
 
     def train_epoch(self, train_loader, epoch):
@@ -1486,7 +1625,12 @@ class MT5Trainer:
                 kps_train = torch.where(mask, torch.zeros_like(kps), kps)
 
             # Forward pass (CE + optional aux losses, single encoder pass)
-            align_text, align_negs, align_neg_mask = self._align_batch(batch)
+            if self.align_mode == 'token':
+                align_tokens, align_token_mask, align_neg_mask = self._align_token_batch(batch)
+                align_text = align_negs = None
+            else:
+                align_text, align_negs, align_neg_mask = self._align_batch(batch)
+                align_tokens = align_token_mask = None
             loss, mse_loss, ctc_log_probs, prosody_aux_loss, align_loss = self.model(
                 kps_train, label_ids, label_attn,
                 input_lengths=input_lengths,
@@ -1497,6 +1641,7 @@ class MT5Trainer:
                 prosody_target=prosody_target,
                 align_text=align_text, align_negatives=align_negs,
                 align_neg_mask=align_neg_mask,
+                align_tokens=align_tokens, align_token_mask=align_token_mask,
             )
             if align_loss is None:
                 align_loss = torch.tensor(0.0, device=self.device)
@@ -1930,6 +2075,11 @@ def main():
     parser.add_argument('--align-negatives', type=int, default=256,
                         help='E5: negatives sampled from the cached table per '
                              'step, on top of the 7 in-batch ones.')
+    parser.add_argument('--align-mode', choices=('seq', 'token'), default='seq',
+                        help='E5 "seq": pooled pose vs one vector per text. '
+                             'E6 "token": each text token matched to its best '
+                             'frame, needs a --per-token cache. Everything else '
+                             '(heads, weight, negatives, teacher) is shared.')
     parser.add_argument('--align-dim', type=int, default=256,
                         help='E5: projection dim for the shared pose/text space.')
     parser.add_argument('--unisign-hand-scale', default=None,
@@ -2114,6 +2264,7 @@ def main():
         align_negatives=args.align_negatives,
         align_weight=args.align_weight,
         align_cache=args.align_cache,
+        align_mode=args.align_mode,
         masked_pose_ratio=args.masked_pose_ratio,
         overfit_n=args.overfit_n,
         ctc_weight=args.ctc_weight,

@@ -19,9 +19,20 @@ drop false negatives: 2.6% of training references are exact duplicates of
 another clip's (repeated broadcast boilerplate), and pushing those apart would
 be actively wrong.
 
+E6 adds --per-token: the same encoder states WITHOUT the mean, one row per
+content token (EOS and padding dropped), for a token-level alignment objective.
+Rows go to <out>.tokens.npy (flat, memory-mappable) and the per-clip index to
+<out>. Same tokenizer, teacher, clip order and batching as the sequence cache,
+so the only difference between E5 and E6 is the pooling. --check-against
+recomputes the E5 mean from the same states and compares it with the existing
+sequence cache, which verifies that.
+
 Usage:
     python scripts/cache_text_embeddings.py --root ~/asan_canonical \
         --out ~/asan_canonical/text_teacher_mt5base.npz
+    python scripts/cache_text_embeddings.py --root ~/asan_canonical --per-token \
+        --out ~/asan_canonical/text_teacher_mt5base_tokens.npz \
+        --check-against ~/asan_canonical/text_teacher_mt5base.npz
 """
 import argparse
 import hashlib
@@ -46,6 +57,10 @@ def main():
     ap.add_argument('--splits', default='train,dev')
     ap.add_argument('--batch-size', type=int, default=64)
     ap.add_argument('--max-tokens', type=int, default=128)
+    ap.add_argument('--per-token', action='store_true',
+                    help='store unpooled per-token states (E6) instead of the mean')
+    ap.add_argument('--check-against', default=None,
+                    help='with --per-token: an E5 sequence cache to verify against')
     args = ap.parse_args()
 
     root = os.path.expanduser(args.root)
@@ -56,6 +71,10 @@ def main():
         cfg = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), '..',
                                                'configs', 'config.yaml')))
         mt5_path = cfg['paths'].get('mt5') or cfg['model'].get('mt5_path')
+    if mt5_path is None:
+        # config.yaml carries no mT5 path, so the lookup above yields None and
+        # from_pretrained(None) fails. The trainer's MT5_PATH is what E5 used.
+        mt5_path = 'google/mt5-base'
     print(f'[teacher] {mt5_path}')
 
     from transformers import MT5EncoderModel, T5Tokenizer
@@ -76,6 +95,12 @@ def main():
                     texts.append(e['text'])
     print(f'[texts] {len(clip_ids)} clips over splits {args.splits}')
 
+    hashes = np.array([int(hashlib.sha1(normalize_kazakh(t).encode()).hexdigest()[:15], 16)
+                       for t in texts], dtype=np.int64)
+    if args.per_token:
+        return write_per_token(tok, enc, device, texts, clip_ids, hashes, mt5_path,
+                               out, args)
+
     vecs = np.zeros((len(texts), enc.config.d_model), dtype=np.float16)
     with torch.no_grad():
         for i in range(0, len(texts), args.batch_size):
@@ -89,13 +114,70 @@ def main():
             if (i // args.batch_size) % 100 == 0:
                 print(f'  {i}/{len(texts)}', flush=True)
 
-    hashes = np.array([int(hashlib.sha1(normalize_kazakh(t).encode()).hexdigest()[:15], 16)
-                       for t in texts], dtype=np.int64)
     np.savez(out, clip_ids=np.array(clip_ids), vecs=vecs, text_hash=hashes,
              teacher=str(mt5_path), splits=args.splits)
     uniq = len(set(hashes.tolist()))
     print(f'[write] {out}\n  {len(clip_ids)} vectors, dim {vecs.shape[1]}, '
           f'{uniq} distinct texts ({100 * (1 - uniq / len(hashes)):.1f}% share a text with another clip)')
+
+
+def write_per_token(tok, enc, device, texts, clip_ids, hashes, mt5_path, out, args):
+    """E6 cache: one row per content token, EOS and padding dropped."""
+    eos = tok.eos_token_id
+    # Pass 1: exact token counts, so the flat array can be preallocated on disk.
+    counts = np.array([sum(1 for i in tok(t, truncation=True, max_length=args.max_tokens)
+                           ['input_ids'] if i != eos) for t in texts], dtype=np.int64)
+    if (counts < 1).any():
+        sys.exit(f'[fatal] {int((counts < 1).sum())} texts have no content tokens')
+    offsets = np.concatenate([[0], np.cumsum(counts)])
+    tok_path = out[:-4] + '.tokens.npy' if out.endswith('.npz') else out + '.tokens.npy'
+    rows = np.lib.format.open_memmap(tok_path, mode='w+', dtype=np.float16,
+                                     shape=(int(offsets[-1]), enc.config.d_model))
+    print(f'[per-token] {int(offsets[-1]):,} rows -> {tok_path} '
+          f'({rows.nbytes / 1e9:.2f} GB)')
+
+    ref = None
+    if args.check_against:
+        z = np.load(os.path.expanduser(args.check_against), allow_pickle=True)
+        if z['clip_ids'].tolist() != clip_ids:
+            sys.exit('[fatal] --check-against cache has a different clip order')
+        ref = z['vecs'].astype(np.float32)
+    worst = 0.0
+
+    with torch.no_grad():
+        for i in range(0, len(texts), args.batch_size):
+            batch = texts[i:i + args.batch_size]
+            t = tok(batch, padding=True, truncation=True, max_length=args.max_tokens,
+                    return_tensors='pt').to(device)
+            h = enc(**t).last_hidden_state                      # (B, L, D)
+            attn, ids = t['attention_mask'].bool(), t['input_ids']
+            if ref is not None:
+                # The E5 mean includes EOS; recompute it exactly to verify the
+                # two caches come from the same states.
+                m = attn.unsqueeze(-1).to(h.dtype)
+                pooled = ((h * m).sum(1) / m.sum(1).clamp(min=1)).float().cpu().numpy()
+                worst = max(worst, float(np.abs(pooled - ref[i:i + len(batch)]).max()))
+            keep = attn & (ids != eos)
+            for j in range(len(batch)):
+                k = i + j
+                v = h[j][keep[j]].float().cpu().numpy().astype(np.float16)
+                if len(v) != counts[k]:
+                    sys.exit(f'[fatal] clip {clip_ids[k]}: {len(v)} rows, expected {counts[k]}')
+                rows[offsets[k]:offsets[k + 1]] = v
+            if (i // args.batch_size) % 100 == 0:
+                print(f'  {i}/{len(texts)}', flush=True)
+    rows.flush()
+
+    np.savez(out, clip_ids=np.array(clip_ids), offsets=offsets, text_hash=hashes,
+             tokens_file=os.path.basename(tok_path), teacher=str(mt5_path),
+             splits=args.splits, dim=enc.config.d_model)
+    print(f'[write] {out}\n  {len(clip_ids)} clips, tokens/clip mean {counts.mean():.1f} '
+          f'max {counts.max()}')
+    if ref is not None:
+        # fp16 storage of the E5 vectors bounds agreement at ~1e-3.
+        print(f'[check] max |pooled - E5 cache| = {worst:.2e}')
+        if worst > 5e-3:
+            sys.exit('[fatal] per-token states do not reproduce the E5 cache')
 
 
 if __name__ == '__main__':
