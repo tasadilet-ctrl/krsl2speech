@@ -1,6 +1,6 @@
 # E6: token-level pose–text alignment
 
-Status: **pre-registered, not yet run.** Results go in a section at the end;
+Status: **complete (2026-09-23) -- 1/3 takeoff, same as baseline.** Results go in a section at the end;
 nothing above it is edited after launch.
 
 ## Why
@@ -98,3 +98,48 @@ evidence of an effect.
 nine checkpoints (B, E5, E6) through one metric path and writing
 `output/e6_rescore/summary.txt`. The whole thing runs on the box; nothing
 depends on a session staying open.
+
+## Results (2026-09-23)
+
+All three seeds finished (10 epochs each; seeds 0/1 in parallel, seed 2 after).
+Re-scored on the canonical 600-clip selection set, beam 4, epoch 10, one metric
+path. Contamination 0/600 for every checkpoint.
+
+| run | Val CE | chrF | BLEU | content recall | final align (chance 5.577) | takeoff |
+|---|---|---|---|---|---|---|
+| E6 seed 0 | 2.671 | 21.39 | 0.47 | 0.034 | 1.52 | no |
+| **E6 seed 1** | **2.300** | **29.31** | **2.60** | **0.123** | 1.18 | **yes** |
+| E6 seed 2 | 2.701 | 20.59 | 0.21 | 0.033 | 1.56 | no |
+
+**Takeoff 1/3.** Against baselines: B (no alignment) 1/3, E5 (sequence
+alignment) 0/3. Pooled, the two alignment arms are 1/6 against the baseline's
+1/3 — no evidence that either changes the takeoff rate, and at three seeds per
+arm these counts cannot be told apart anyway.
+
+**Which pre-committed row fires:** "≤ 1/3, align loss well below chance, mean
+Val CE ≤ 2.75", with its condition met. Alignment fell to 1.18–1.56 against a
+chance level of 5.577, so the objective engaged hard. Mean Val CE 2.557, and
+both non-takeoff seeds (2.671, 2.701) are better than the worst non-takeoff
+baseline (2.718), so there is no interference.
+
+Reading, as written before the run: **pooling was not the problem.** Two
+encoder-side objectives have now driven the alignment loss far below chance
+while leaving the takeoff rate unchanged. The encoder is made informative; the
+decoder still does not use it.
+
+**Takeoff lands in the same place regardless of objective.** The three runs that
+took off across all of E3/E5/E6 sit at chrF 29.79 (B s0), 29.31 (E6 s1) — with
+content recall 0.128 and 0.123. Non-takeoff runs sit at 19.8–22.1 with recall
+0.025–0.040. Nothing tried so far moves either mode; only which mode a run lands
+in, and that has looked like chance throughout.
+
+### Next
+
+Per the fired row: pressure on what the decoder reads, not on the pose
+embedding. One untested lever is cheaper and more basic — **E4, the
+learning-rate balance**. mT5 trains at 5e-4 while the encoder trains at 5e-5, a
+10x gap, and the audit flagged it on 2026-09-17 as a hypothesis never screened.
+A decoder that adapts ten times faster than its encoder is a plausible
+mechanism for "decoder fits the language prior before the encoder is worth
+reading", which is exactly the failure both alignment arms left untouched.
+Screen it by takeoff rate over three seeds, same as here.
