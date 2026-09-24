@@ -780,7 +780,7 @@ class MT5Trainer:
                  align_dim=256, align_mode='seq',
                  masked_pose_ratio=0.0, overfit_n=0,
                  ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
-                 grad_accum=None, encoder_lr=None,
+                 grad_accum=None, encoder_lr=None, mt5_lr=None,
                  use_pgf=False, hand_crop_root=None, pgf_p_samp=0.5,
                  pretrained_pgf=None, prosody_aux_weight=0.0, prosody_root=None,
                  select_metric='wer'):
@@ -1017,6 +1017,11 @@ class MT5Trainer:
         # actually needs to learn (KRSL-specific discrimination, not just
         # light CSL adaptation). --encoder-lr overrides this directly.
         encoder_lr = encoder_lr if encoder_lr is not None else base_lr / 10
+        # E4 learning-rate screen: the decoder (582M) trains at base_lr while
+        # the encoder (5.3M) trains at base_lr/10, a 10x gap never screened.
+        # --mt5-lr overrides the DECODER group only; pose_norm and aux heads
+        # stay at base_lr so the screen changes exactly one thing.
+        mt5_lr = mt5_lr if mt5_lr is not None else base_lr
 
         if freeze_spatial:
             self.encoder.freeze_spatial()
@@ -1028,9 +1033,9 @@ class MT5Trainer:
 
         core = self.model.module if self.distributed else self.model
         if self.use_lora:
-            param_groups.append({'params': self.lora_params, 'lr': base_lr})
+            param_groups.append({'params': self.lora_params, 'lr': mt5_lr})
         else:
-            param_groups.append({'params': core.mt5.parameters(), 'lr': base_lr})
+            param_groups.append({'params': core.mt5.parameters(), 'lr': mt5_lr})
 
         # pose_norm bridges encoder → MT5; param groups are explicit, so it
         # must be added or it would silently never train
@@ -1082,7 +1087,8 @@ class MT5Trainer:
         n_opt = sum(p.numel() for g in param_groups for p in g['params'])
         n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         log(f"[Optimizer] {len(param_groups)} groups, {n_opt:,} params "
-            f"({n_train:,} trainable in model)")
+            f"({n_train:,} trainable in model); lrs "
+            + str([f"{g['lr']:.2e}" for g in param_groups]))
         assert n_opt == n_train, "optimizer/model trainable parameter mismatch"
 
         self.optimizer = AdamW(param_groups, weight_decay=0.01)
@@ -1107,11 +1113,12 @@ class MT5Trainer:
 
         log(f"\n[MT5 Trainer] Differential LR training:")
         log(f"  Encoder LR: {encoder_lr:.6f} ({self.encoder_total_params:,} params)")
+        log(f"  LR ratio:   mt5/encoder = {mt5_lr / max(encoder_lr, 1e-12):.2f}")
         if self.use_lora:
             lora_n = sum(p.numel() for p in self.lora_params)
-            log(f"  MT5 LoRA LR: {base_lr:.6f} (r={lora_r}, alpha={lora_alpha}, {lora_n:,} trainable)")
+            log(f"  MT5 LoRA LR: {mt5_lr:.6f} (r={lora_r}, alpha={lora_alpha}, {lora_n:,} trainable)")
         else:
-            log(f"  MT5 LR:     {base_lr:.6f} ({self.mt5_params:,} params)")
+            log(f"  MT5 LR:     {mt5_lr:.6f} ({self.mt5_params:,} params)")
         log(f"  Warmup:     {self.warmup_steps} steps, then cosine decay")
         if freeze_spatial:
             log(f"  Frozen:     spatial STGCN + projection")
@@ -2125,6 +2132,11 @@ def main():
                              "len(train_loader) is tiny, so the config's "
                              "grad_accum=4 can collapse to ~1 optimizer step "
                              "per epoch. Pass --grad-accum 1 for sanity checks.")
+    parser.add_argument('--mt5-lr', type=float, default=None,
+                        help='E4: LR for the mT5 decoder group (default: the '
+                             'config learning_rate, 5e-4). The encoder defaults '
+                             'to a tenth of that; this flag makes the ratio '
+                             'testable rather than fixed.')
     parser.add_argument('--encoder-lr', type=float, default=None,
                         help='Override the encoder LR (default: base_lr/10, '
                              "a 'gentle adaptation' choice for the "
@@ -2272,6 +2284,7 @@ def main():
         resume=args.resume,
         grad_accum=args.grad_accum,
         encoder_lr=args.encoder_lr,
+        mt5_lr=args.mt5_lr,
         use_pgf=args.use_pgf,
         hand_crop_root=args.hand_crop_root,
         pgf_p_samp=args.pgf_p_samp,
