@@ -147,8 +147,8 @@ row stands: **E4 says nothing about whether the LR ratio drives takeoff.**
 range, so unlike E4 the decoder trained normally and the takeoff count is readable.
 
 **Pre-committed reading for 2/3 fires:** "Encoder rate matters but does not
-determine takeoff. Confirm with three more seeds." Launched immediately as
-seeds 3–5 (`run_e4b.sh`, QUEUE=(3 4 5)).
+determine takeoff. Confirm with three more seeds." Launched as seeds 3–5
+(`run_e4b.sh`, QUEUE=(3 4 5)) — **which did not complete, see below.**
 
 Two observations that are NOT yet claims:
 - **The ceiling may have moved.** E4b seed 1 reaches chrF 31.47 / recall 0.145,
@@ -160,3 +160,37 @@ Two observations that are NOT yet claims:
 
 **Statistics, stated plainly:** 2/3 versus 1/3 is not significant (Fisher exact
 p = 1.0). This is a reason to run more seeds, not a result.
+
+## Seeds 3–5 did not complete (checked 2026-09-27)
+
+The confirmation run died and the result is still 2/3 on three seeds, not 2/6.
+
+| seed | reached | state |
+|---|---|---|
+| 3 | epoch 3/10 | died |
+| 4 | epoch 2/10 (batch 6500) | died |
+| 5 | never launched | queued behind 3/4 |
+
+Both logs stop mid-run with no traceback, and the scheduler logged neither a
+death nor a completion, so it went with them. The box had not rebooted (up 80
+days) and `dmesg` is not readable from our account, so whether the kernel
+killed them is unknown. Nothing has been running since; GPUs are idle.
+
+What this does **not** change: E4b's 2/3 stands on seeds 0–2, whose train CE
+passed the validity gate and whose checkpoints were scored. What it does change
+is that the "confirm with three more seeds" step is still outstanding, and the
+two observations flagged as not-yet-claims — the possibly higher ceiling
+(seed 1 at chrF 31.47) and the worse failure mode (seed 2 at 11.14) — remain at
+n=1 each.
+
+Two defects in `run_e4b.sh` are fixed rather than worked around, because both
+would have bitten the rerun:
+
+- The end-of-run summary looped over seeds `0 1 2` while the queue ran `3 4 5`,
+  so it printed the *previous* run's seeds and would have reported a finished
+  run that never happened. Queue, summary and rescore now read one `SEEDS` list.
+- There was no rescore step, unlike `run_e6.sh`. That is why E4b's numbers came
+  from a hand-run rescore, which was interrupted part-way and left a directory
+  holding E4b seeds 0–2 plus a stray `E4_s2` with no predictions file. The
+  script now rescores and applies the takeoff rule on the box, and an
+  incomplete seed is reported and excluded instead of silently scored.
