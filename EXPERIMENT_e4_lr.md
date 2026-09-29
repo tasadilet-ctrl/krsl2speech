@@ -147,8 +147,8 @@ row stands: **E4 says nothing about whether the LR ratio drives takeoff.**
 range, so unlike E4 the decoder trained normally and the takeoff count is readable.
 
 **Pre-committed reading for 2/3 fires:** "Encoder rate matters but does not
-determine takeoff. Confirm with three more seeds." Launched as seeds 3–5
-(`run_e4b.sh`, QUEUE=(3 4 5)) — **which did not complete, see below.**
+determine takeoff. Confirm with three more seeds." Launched immediately as
+seeds 3–5 (`run_e4b.sh`, QUEUE=(3 4 5)).
 
 Two observations that are NOT yet claims:
 - **The ceiling may have moved.** E4b seed 1 reaches chrF 31.47 / recall 0.145,
@@ -161,36 +161,66 @@ Two observations that are NOT yet claims:
 **Statistics, stated plainly:** 2/3 versus 1/3 is not significant (Fisher exact
 p = 1.0). This is a reason to run more seeds, not a result.
 
-## Seeds 3–5 did not complete (checked 2026-09-27)
+## E4b final (2026-09-29): 2/6 takeoff — the same rate as baseline
 
-The confirmation run died and the result is still 2/3 on three seeds, not 2/6.
+Seeds 3–5 reran on the fixed script and completed; the run rescored all six
+seeds itself and applied the takeoff rule (chrF ≥ 26 and content recall ≥ 0.08).
 
-| seed | reached | state |
+| checkpoint | chrF | recall | BLEU | distinct | top-1 share | takeoff |
+|---|---|---|---|---|---|---|
+| B_s0 | 29.79 | 0.128 | 2.63 | 598/600 | 0.3% | YES |
+| B_s1 | 21.02 | 0.031 | 0.42 | 503/600 | 5.3% | no |
+| B_s2 | 19.83 | 0.025 | 0.27 | 523/600 | 2.3% | no |
+| E4b_s0 | 29.73 | 0.125 | 2.39 | 600/600 | 0.2% | YES |
+| E4b_s1 | 31.47 | 0.145 | 3.04 | 599/600 | 0.3% | YES |
+| E4b_s2 | 11.14 | 0.010 | 0.03 | 128/600 | 67.7% | no |
+| E4b_s3 | 17.17 | 0.021 | 0.24 | 300/600 | 25.5% | no |
+| E4b_s4 | 18.56 | 0.019 | 0.29 | 402/600 | 7.3% | no |
+| E4b_s5 | 24.24 | 0.059 | 0.80 | 597/600 | 0.5% | no |
+
+**B 1/3 (33%) vs E4b 2/6 (33%) — identical.** Mean chrF is slightly lower for
+E4b (22.05 vs 23.54). **The pre-committed "1/3 (= baseline)" row fires:** encoder
+rate is not the mechanism either.
+
+**The 2/3 reported on 2026-09-24 was small-sample noise.** Three seeds put it at
+67%, six put it at 33%. That is the same lesson E3 taught about single-seed arm
+comparisons, repeated one level up: three seeds are not enough to estimate a rate
+near 1/3 either.
+
+**One observation did survive, and it is negative.** The "worse failure mode"
+flagged at n=1 now holds at n=4: E4b's non-takeoff seeds land at chrF 11.1, 17.2,
+18.6 and 24.2 against the baseline's 19.8–21.0, and their degeneracy is far more
+severe — seed 2 emits one sentence for 67.7% of clips and seed 3 for 25.5%, where
+no baseline run exceeds 5.3%. A faster encoder widens the spread without moving
+the mean or the rate. The "higher ceiling" observation stays at n=2 (29.73,
+31.47 vs the baseline's single 29.79) and is not claimable.
+
+### What this closes
+
+Three encoder-side interventions have now been screened with seeds:
+
+| arm | what it did to the encoder | takeoff |
 |---|---|---|
-| 3 | epoch 3/10 | died |
-| 4 | epoch 2/10 (batch 6500) | died |
-| 5 | never launched | queued behind 3/4 |
+| E5 | made pooled embeddings identify their transcript | 0/3 |
+| E6 | same, per token | 1/3 |
+| E4b | let it adapt twice as fast relative to the decoder | 2/6 |
+| baseline | — | 1/3 |
 
-Both logs stop mid-run with no traceback, and the scheduler logged neither a
-death nor a completion, so it went with them. The box had not rebooted (up 80
-days) and `dmesg` is not readable from our account, so whether the kernel
-killed them is unknown. Nothing has been running since; GPUs are idle.
+None changes how often the decoder starts reading the encoder. **The
+encoder-side family is closed.** Takeoff across every run scored against this
+rule is 4/18 (22%), or 4/15 (27%) excluding E4's three undertrained seeds,
+which cannot be classified either way. Those are the only runs the rule has
+been applied to: E3's other arms (legacy, signspace, handscale, asrfrag, B20)
+were never rescored on the canonical set, so they are not in the count.
 
-What this does **not** change: E4b's 2/3 stands on seeds 0–2, whose train CE
-passed the validity gate and whose checkpoints were scored. What it does change
-is that the "confirm with three more seeds" step is still outstanding, and the
-two observations flagged as not-yet-claims — the possibly higher ceiling
-(seed 1 at chrF 31.47) and the worse failure mode (seed 2 at 11.14) — remain at
-n=1 each.
+### Next, per the pre-committed row
 
-Two defects in `run_e4b.sh` are fixed rather than worked around, because both
-would have bitten the rerun:
-
-- The end-of-run summary looped over seeds `0 1 2` while the queue ran `3 4 5`,
-  so it printed the *previous* run's seeds and would have reported a finished
-  run that never happened. Queue, summary and rescore now read one `SEEDS` list.
-- There was no rescore step, unlike `run_e6.sh`. That is why E4b's numbers came
-  from a hand-run rescore, which was interrupted part-way and left a directory
-  holding E4b seeds 0–2 plus a stray `E4_s2` with no predictions file. The
-  script now rescores and applies the takeoff rule on the box, and an
-  incomplete seed is reported and excluded instead of silently scored.
+"What the decoder cross-attends to, or initialization." Initialization is the
+stronger lead and the only thing that has ever produced a materially better
+number: the colleague's KRSL-tuned mT5 reached chrF 36 with recall 0.207 (E1),
+against base mT5's ceiling of ~29.8–31.5 in every run since. Its provenance is
+unrecorded, so it cannot back a published claim — but the same effect is
+reachable cleanly by adapting base mT5 on the canonical TRAIN transcripts only
+(text, no video), which uses nothing outside our own training split, and then
+initializing from that. Cheap (text-only), clean-provenance, and it targets the
+decoder rather than the encoder.
