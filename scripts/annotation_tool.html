@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KRSL Ceiling Study</title>
+<style>
+  :root {
+    --bg: #f6f6f3; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #dcdcd6;
+    --signed: #2f7d4f; --signed-bg: #dff1e5; --not: #b23b3b; --not-bg: #f7e0de;
+    --unsure: #6b6b66; --unsure-bg: #e9e9e4; --accent: #2b5d8a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #161615; --panel: #1f1f1d; --ink: #ececea; --muted: #9a9a94; --line: #34342f;
+      --signed: #7fd1a0; --signed-bg: #1f3a2a; --not: #f09a92; --not-bg: #432422;
+      --unsure: #b5b5ae; --unsure-bg: #2c2c29; --accent: #8cb8e0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+           padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+           position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; }
+  .grow { flex: 1; }
+  .bar { height: 6px; width: 160px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--signed); width: 0; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px; display: grid;
+         grid-template-columns: minmax(0, 380px) minmax(0, 1fr); gap: 20px; }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+  video { width: 100%; background: #000; border-radius: 6px; display: block; image-rendering: auto; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
+  button, select, input[type=text] { font: inherit; color: var(--ink); background: var(--bg);
+         border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  button:hover { border-color: var(--muted); }
+  button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .tokens { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 4px; }
+  .tok { font-size: 18px; padding: 4px 9px; border-radius: 6px; border: 1px dashed var(--muted);
+         background: transparent; user-select: none; }
+  .tok.signed { background: var(--signed-bg); border: 1px solid var(--signed); color: var(--signed); }
+  .tok.not    { background: var(--not-bg);    border: 1px solid var(--not);    color: var(--not);
+                text-decoration: line-through; }
+  .tok.unsure { background: var(--unsure-bg); border: 1px solid var(--unsure); color: var(--unsure); }
+  .legend span { margin-right: 14px; font-size: 13px; color: var(--muted); }
+  .q { margin-top: 14px; }
+  .q label { display: block; font-weight: 600; margin-bottom: 4px; }
+  .q .sub { font-weight: 400; color: var(--muted); font-size: 13px; }
+  .opts { display: flex; flex-wrap: wrap; gap: 6px; }
+  textarea { width: 100%; min-height: 70px; font: inherit; color: var(--ink); background: var(--bg);
+             border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+  .status { font-size: 13px; color: var(--muted); }
+  .done { color: var(--signed); font-weight: 600; }
+  .nav { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
+  .dot { width: 26px; height: 26px; padding: 0; font-size: 11px; }
+  .dot.complete { background: var(--signed-bg); border-color: var(--signed); }
+  .dot.current { outline: 2px solid var(--accent); }
+  .hint { font-size: 13px; color: var(--muted); margin: 4px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>KRSL ceiling study</h1>
+  <span class="status" id="prog"></span>
+  <div class="bar"><i id="progbar"></i></div>
+  <span class="grow"></span>
+  <input type="text" id="annotator" placeholder="Your name / Ваше имя" size="18">
+  <button id="exportBtn">Export results</button>
+  <label><button id="importBtn" type="button">Import</button>
+    <input type="file" id="importFile" accept=".json" hidden></label>
+</header>
+
+<main>
+  <section>
+    <video id="vid" muted loop playsinline controls></video>
+    <div class="row">
+      <span class="status">Speed / Скорость:</span>
+      <button data-rate="0.25">0.25×</button><button data-rate="0.5">0.5×</button>
+      <button data-rate="0.75">0.75×</button><button data-rate="1">1×</button>
+    </div>
+    <div class="row">
+      <button id="back">◀ frame</button><button id="play">Play / Pause</button>
+      <button id="fwd">frame ▶</button>
+    </div>
+    <p class="hint">No sound, on purpose. / Звука нет намеренно.</p>
+    <div class="nav" id="dots"></div>
+  </section>
+
+  <section>
+    <div class="row" style="margin-top:0">
+      <strong id="title"></strong><span class="grow"></span>
+      <span id="clipstate" class="status"></span>
+    </div>
+
+    <div class="q">
+      <label>1. Which words were SIGNED? <span class="sub">Какие слова были показаны жестами? Click to cycle.</span></label>
+      <div class="legend"><span>green = signed / показано</span><span>red = not signed / не показано</span><span>grey = unsure / не уверен(а)</span></div>
+      <div class="tokens" id="tokens"></div>
+      <div class="row">
+        <button id="allSigned">All signed</button><button id="allNot">All not signed</button>
+        <button id="clearAll">Clear</button>
+      </div>
+    </div>
+
+    <div class="q">
+      <label>2. Does the signing in this clip correspond to this text?
+        <span class="sub">Соответствует ли перевод этому тексту?</span></label>
+      <div class="opts" data-q="align">
+        <button data-v="mostly">Mostly / В основном</button>
+        <button data-v="partly">Partly / Частично</button>
+        <button data-v="none">Not at all / Совсем нет</button>
+        <button data-v="cannot_tell">Can't tell / Не понятно</button>
+      </div>
+    </div>
+
+    <div class="q">
+      <label>3. Are the hands clear enough to read?
+        <span class="sub">Достаточно ли чётко видны руки?</span></label>
+      <div class="opts" data-q="quality">
+        <button data-v="clear">Clear / Чётко</button>
+        <button data-v="partly">Partly / Частично</button>
+        <button data-v="unreadable">Unreadable / Нечитаемо</button>
+      </div>
+    </div>
+
+    <div class="q">
+      <label>4. What was actually signed? <span class="sub">(optional, Kazakh or Russian / по желанию)</span></label>
+      <textarea id="signedText" placeholder="If it differs from the transcript… / Если отличается от текста…"></textarea>
+    </div>
+
+    <div class="nav">
+      <button id="prev">◀ Previous</button>
+      <button id="next">Next ▶</button>
+      <button id="nextTodo">Next unfinished ▶</button>
+    </div>
+  </section>
+</main>
+
+<script src="data.js"></script>
+<script>
+(function () {
+  'use strict';
+  var KEY = 'krsl_ceiling_v1';
+  var CYCLE = [null, 'signed', 'not', 'unsure'];
+  var study = window.STUDY;
+  if (!study || !study.clips || !study.clips.length) {
+    document.body.innerHTML = '<p style="padding:20px">data.js is missing or empty. Keep index.html, data.js and the clips/ folder together.</p>';
+    return;
+  }
+  var clips = study.clips;
+  var state = { annotator: '', results: {} };
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved) state = JSON.parse(saved);
+  } catch (e) { /* storage unavailable: work in memory, export still works */ }
+  state.results = state.results || {};
+
+  var cur = 0, shownAt = Date.now();
+  var $ = function (id) { return document.getElementById(id); };
+  var vid = $('vid');
+
+  function rec(c) {
+    var r = state.results[c.clip_id];
+    if (!r) {
+      r = state.results[c.clip_id] = { labels: c.tokens.map(function () { return null; }),
+        align: null, quality: null, signed_text: '', seconds: 0 };
+    }
+    return r;
+  }
+  function complete(c) {
+    var r = state.results[c.clip_id];
+    return !!r && r.align !== null && r.labels.every(function (l) { return l !== null; });
+  }
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+  }
+  function bank() {               // add time spent on the current clip
+    var r = rec(clips[cur]);
+    r.seconds += Math.round((Date.now() - shownAt) / 1000);
+    shownAt = Date.now();
+  }
+
+  function render() {
+    var c = clips[cur], r = rec(c);
+    $('title').textContent = 'Clip ' + c.n + ' / ' + clips.length;
+    if (vid.dataset.src !== c.clip_id) {
+      vid.src = 'clips/' + c.clip_id + '.mp4';
+      vid.dataset.src = c.clip_id;
+      vid.playbackRate = rate;
+      vid.play().catch(function () {});
+    }
+    var box = $('tokens');
+    box.innerHTML = '';
+    c.tokens.forEach(function (t, i) {
+      var b = document.createElement('button');
+      b.className = 'tok' + (r.labels[i] ? ' ' + r.labels[i] : '');
+      b.textContent = t;
+      b.title = r.labels[i] || 'unmarked';
+      b.onclick = function () {
+        r.labels[i] = CYCLE[(CYCLE.indexOf(r.labels[i]) + 1) % CYCLE.length];
+        save(); render();
+      };
+      box.appendChild(b);
+    });
+    document.querySelectorAll('.opts').forEach(function (g) {
+      var q = g.dataset.q;
+      g.querySelectorAll('button').forEach(function (b) {
+        b.classList.toggle('on', r[q] === b.dataset.v);
+      });
+    });
+    $('signedText').value = r.signed_text || '';
+    $('clipstate').innerHTML = complete(c) ? '<span class="done">✓ complete</span>'
+      : (r.labels.filter(function (l) { return l === null; }).length + ' words unmarked' +
+         (r.align === null ? ', question 2 unanswered' : ''));
+    var n = clips.filter(complete).length;
+    $('prog').textContent = n + ' / ' + clips.length + ' complete';
+    $('progbar').style.width = (100 * n / clips.length) + '%';
+    var dots = $('dots');
+    dots.innerHTML = '';
+    clips.forEach(function (cc, i) {
+      var d = document.createElement('button');
+      d.className = 'dot' + (complete(cc) ? ' complete' : '') + (i === cur ? ' current' : '');
+      d.textContent = cc.n;
+      d.onclick = function () { go(i); };
+      dots.appendChild(d);
+    });
+  }
+  function go(i) {
+    bank();
+    cur = (i + clips.length) % clips.length;
+    save(); render();
+  }
+
+  function setAll(v) {
+    var r = rec(clips[cur]);
+    r.labels = r.labels.map(function () { return v; });
+    save(); render();
+  }
+  $('allSigned').onclick = function () { setAll('signed'); };
+  $('allNot').onclick = function () { setAll('not'); };
+  $('clearAll').onclick = function () { setAll(null); };
+
+  document.querySelectorAll('.opts').forEach(function (g) {
+    g.querySelectorAll('button').forEach(function (b) {
+      b.onclick = function () { rec(clips[cur])[g.dataset.q] = b.dataset.v; save(); render(); };
+    });
+  });
+  $('signedText').oninput = function (e) { rec(clips[cur]).signed_text = e.target.value; save(); };
+
+  var rate = 0.5;
+  document.querySelectorAll('[data-rate]').forEach(function (b) {
+    b.onclick = function () {
+      rate = parseFloat(b.dataset.rate); vid.playbackRate = rate;
+      document.querySelectorAll('[data-rate]').forEach(function (x) { x.classList.toggle('on', x === b); });
+    };
+    b.classList.toggle('on', parseFloat(b.dataset.rate) === rate);
+  });
+  var FRAME = 1 / 25;
+  $('back').onclick = function () { vid.pause(); vid.currentTime = Math.max(0, vid.currentTime - FRAME); };
+  $('fwd').onclick = function () { vid.pause(); vid.currentTime = Math.min(vid.duration || 0, vid.currentTime + FRAME); };
+  $('play').onclick = function () { if (vid.paused) vid.play(); else vid.pause(); };
+
+  $('prev').onclick = function () { go(cur - 1); };
+  $('next').onclick = function () { go(cur + 1); };
+  $('nextTodo').onclick = function () {
+    for (var k = 1; k <= clips.length; k++) {
+      var j = (cur + k) % clips.length;
+      if (!complete(clips[j])) { go(j); return; }
+    }
+    alert('All clips are complete. Please press "Export results". / Все фрагменты готовы.');
+  };
+
+  $('annotator').value = state.annotator || '';
+  $('annotator').oninput = function (e) { state.annotator = e.target.value; save(); };
+
+  $('exportBtn').onclick = function () {
+    bank(); save();
+    var payload = { tool: 'krsl_ceiling_v1', meta: study.meta, annotator: state.annotator,
+      exported_at: new Date().toISOString(),
+      n_complete: clips.filter(complete).length, n_total: clips.length,
+      results: clips.map(function (c) {
+        var r = state.results[c.clip_id] || null;
+        return { clip_id: c.clip_id, source: c.source, tokens: c.tokens,
+                 labels: r ? r.labels : null, align: r ? r.align : null,
+                 quality: r ? r.quality : null, signed_text: r ? r.signed_text : '',
+                 seconds: r ? r.seconds : 0, complete: complete(c) };
+      }) };
+    var blob = new Blob([JSON.stringify(payload, null, 1)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'ceiling_study_' + (state.annotator || 'annotator').replace(/\W+/g, '_') +
+                 '_' + new Date().toISOString().slice(0, 10) + '.json';
+    a.click();
+  };
+  $('importBtn').onclick = function () { $('importFile').click(); };
+  $('importFile').onchange = function (e) {
+    var f = e.target.files[0]; if (!f) return;
+    var rd = new FileReader();
+    rd.onload = function () {
+      try {
+        var p = JSON.parse(rd.result);
+        p.results.forEach(function (r) {
+          if (r.labels) state.results[r.clip_id] = { labels: r.labels, align: r.align,
+            quality: r.quality, signed_text: r.signed_text || '', seconds: r.seconds || 0 };
+        });
+        if (p.annotator) state.annotator = p.annotator;
+        $('annotator').value = state.annotator;
+        save(); render();
+      } catch (err) { alert('Could not read that file: ' + err.message); }
+    };
+    rd.readAsText(f);
+  };
+  window.addEventListener('beforeunload', function () { bank(); save(); });
+
+  var firstTodo = clips.findIndex(function (c) { return !complete(c); });
+  cur = firstTodo < 0 ? 0 : firstTodo;
+  render();
+})();
+</script>
+</body>
+</html>

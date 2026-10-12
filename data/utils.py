@@ -919,3 +919,54 @@ def resample_hand_meta(ref, valid, score, target_len):
                 np.zeros((n,), dtype=np.float32))
     idx = _nearest_indices(t_src, target_len)
     return ref[idx], valid[idx], score[idx]
+
+
+# Measured with ffprobe (r_frame_rate == avg_frame_rate, and keypoint counts
+# match the videos' nb_frames to within one frame). NOT inferred.
+SOURCE_FPS = {'informburo': 50, 'khabar': 25, 'qazaqstantv': 30}
+
+
+def resample_pose(wb, sc, src_fps, tgt_fps):
+    """
+    Resample a clip's wholebody keypoints from src_fps to tgt_fps along time.
+
+    Why this exists: the three sources were captured at 50 / 25 / 30 fps and
+    nothing downstream normalised them, so the same sign spans twice as many
+    frames in informburo as in khabar. The ST-GCN's temporal kernels are a fixed
+    number of FRAMES wide, so it had to learn every sign at three different
+    temporal scales at once.
+
+    Linear interpolation in time, with one guard: an undetected keypoint is
+    stored as exactly (0, 0), and blending that with a real coordinate would
+    invent a joint position halfway to the origin. Where either neighbour is
+    (0, 0) the nearer neighbour is copied instead.
+
+    Args:
+        wb: (T, J, 2) float32 keypoint coordinates
+        sc: (T, J)    float32 scores (unbounded for this corpus, not probabilities)
+    Returns:
+        (T', J, 2), (T', J) with T' = round(T * tgt_fps / src_fps)
+    """
+    if src_fps == tgt_fps or len(wb) < 2:
+        return wb, sc
+    T = len(wb)
+    T2 = max(1, int(round(T * tgt_fps / float(src_fps))))
+    pos = np.linspace(0.0, T - 1, T2)
+    lo = np.floor(pos).astype(np.int64)
+    hi = np.minimum(lo + 1, T - 1)
+    frac = (pos - lo).astype(np.float32)
+
+    wl, wh = wb[lo], wb[hi]
+    out = wl * (1.0 - frac[:, None, None]) + wh * frac[:, None, None]
+    # Undetected joints are exactly (0,0): copy the nearer neighbour instead of
+    # interpolating toward the origin.
+    dead_l = (wl == 0).all(axis=-1)
+    dead_h = (wh == 0).all(axis=-1)
+    near = np.where(frac[:, None, None] < 0.5, wl, wh)
+    bad = dead_l | dead_h
+    out[bad] = near[bad]
+
+    sl, sh = sc[lo], sc[hi]
+    out_sc = sl * (1.0 - frac[:, None]) + sh * frac[:, None]
+    out_sc[bad] = np.where(frac[:, None] < 0.5, sl, sh)[bad]
+    return out.astype(np.float32), out_sc.astype(np.float32)

@@ -167,17 +167,19 @@ def breakdown(rows):
 
 def build_loader(root, manifest_path, use_enriched, signspace, downsample,
                  tokenizer, batch_size, real_wrists=False, score_quantiles=None,
-                 unisign_preprocess=False, unisign_hand_scale=None):
+                 unisign_preprocess=False, unisign_hand_scale=None,
+                 target_fps=None, cap_frames=None, split='val'):
     with open(manifest_path) as fh:
         manifest = {m['clip_id']: m for m in json.load(fh)}
     parts, meta = [], []
     for src in SOURCES:
         with contextlib.redirect_stdout(io.StringIO()):
-            ds = AsanDataset(root=root, sources=[src], split='val', lang='kz',
+            ds = AsanDataset(root=root, sources=[src], split=split, lang='kz',
                              use_enriched=use_enriched, signspace=signspace,
                              real_wrists=real_wrists, score_quantiles=score_quantiles,
                              unisign_preprocess=unisign_preprocess,
                              unisign_hand_scale=unisign_hand_scale,
+                             target_fps=target_fps, cap_frames=cap_frames,
                              downsample_every=downsample)
         parts.append(ds)
     indices, offset = [], 0
@@ -225,6 +227,9 @@ def load_weights(model, path, device):
 # with a different setting than it trained with gets silently wrong inputs.
 _INPUT_FLAGS = ('use_enriched', 'signspace', 'real_wrists', 'score_quantiles',
                 'unisign_preprocess', 'unisign_hand_scale', 'block_padding_mask')
+# Flags whose VALUE matters, not just whether it is set: scoring a 25 fps
+# checkpoint at 30 fps would pass a bool() comparison and silently rescale time.
+_EXACT_FLAGS = ('target_fps',)
 
 
 def check_run_args(info, args, path):
@@ -238,11 +243,16 @@ def check_run_args(info, args, path):
             trained, scoring = bool(trained), bool(scoring)
         if bool(trained) != bool(scoring):
             bad.append(f"{k}: trained={ra[k]!r} scoring={getattr(args, k)!r}")
+    for k in _EXACT_FLAGS:
+        if k not in ra:
+            continue
+        if ra[k] != getattr(args, k, None):
+            bad.append(f"{k}: trained={ra[k]!r} scoring={getattr(args, k, None)!r}")
     if bad:
         sys.exit(f"[fatal] {path} input pipeline mismatch -- " + '; '.join(bad))
 
 
-def run(model, loader, meta, device, decode):
+def run(model, loader, meta, device, decode, shuffle_pose=False):
     # Key on clip_id, never on position: SimpleCollator sorts each batch by
     # length and drops invalid samples, so positional matching silently
     # attaches the wrong source/video/contamination label to a prediction.
@@ -255,7 +265,7 @@ def run(model, loader, meta, device, decode):
                 continue
             hyps = model.generate(batch['keypoints'].to(device),
                                   input_lengths=batch['input_lengths'].to(device),
-                                  **decode)
+                                  shuffle_pose=shuffle_pose, **decode)
             ids = batch['clip_ids']
             assert len(ids) == len(hyps) == len(batch['texts'])
             for cid, ref, hyp in zip(ids, batch['texts'], hyps):
@@ -268,15 +278,17 @@ def run(model, loader, meta, device, decode):
     return rows
 
 
-def evaluate(tag, model, loader, meta, device, decode, seen, out_dir):
+def evaluate(tag, model, loader, meta, device, decode, seen, out_dir,
+             shuffle_pose=False):
     t0 = time.time()
-    rows = run(model, loader, meta, device, decode)
+    rows = run(model, loader, meta, device, decode, shuffle_pose=shuffle_pose)
     for r in rows:
         r['contaminated'] = (r['source'], r['video_id']) in seen
     with open(os.path.join(out_dir, f'{tag}.predictions.jsonl'), 'w') as fh:
         for r in rows:
             fh.write(json.dumps(r, ensure_ascii=False) + '\n')
-    res = {'tag': tag, 'decode': decode, 'coverage': f'{len(rows)}/{len(meta)}',
+    res = {'tag': tag, 'decode': decode, 'shuffle_pose': shuffle_pose,
+           'coverage': f'{len(rows)}/{len(meta)}',
            'n_contaminated': sum(r['contaminated'] for r in rows),
            'all': breakdown(rows),
            'clean': breakdown([r for r in rows if not r['contaminated']]),
@@ -307,6 +319,17 @@ def main():
     ap.add_argument('--unisign-preprocess', action='store_true')
     ap.add_argument('--unisign-hand-scale', default=None)
     ap.add_argument('--batch-size', type=int, default=16)
+    ap.add_argument('--downsample-every', type=int, default=None,
+                    help='Optional assertion: refuse any checkpoint not trained at '
+                         'this stride. By default each checkpoint is scored at '
+                         'the stride in its own run_args.')
+    ap.add_argument('--target-fps', type=int, default=None,
+                    help='Must match the checkpoint; enforced exactly, not as a bool.')
+    ap.add_argument('--shuffle-pose', action='store_true',
+                    help='E8 step 1: decode every clip against another clip\'s '
+                         'pose (encoder output rolled by 1 within each '
+                         'length-sorted batch). Measures how much the decoder '
+                         'uses its encoder: delta = chrF(clean) - chrF(this).')
     ap.add_argument('--out', default='output/e1')
     ap.add_argument('--sweep-on', default=None,
                     help="checkpoint label to sweep decoding on, or 'auto'")
@@ -320,7 +343,12 @@ def main():
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    downsample = cfg['paths']['asan'].get('downsample_every', 1)
+    # Stride is taken from each CHECKPOINT, not from the config: the config
+    # default changed from 2 to 1 on 2026-10-08, and reading it here would
+    # silently score every older checkpoint at twice the frame rate it
+    # trained on. Checkpoints that predate the run_args key all logged
+    # downsample=2x (34/34 train logs), hence the legacy value.
+    LEGACY_STRIDE = 2
 
     specs = []
     for spec in args.ckpt:
@@ -342,18 +370,27 @@ def main():
                                   real_wrists=args.real_wrists,
                                   unisign_input=args.unisign_preprocess)
         model = UniSignMT5(encoder=encoder, lang='Kazakh').to(device)
-    loader, meta = build_loader(root, manifest, args.use_enriched, args.signspace,
-                                downsample, model.mt5_tokenizer, args.batch_size,
-                                real_wrists=args.real_wrists,
-                                score_quantiles=args.score_quantiles,
-                                unisign_preprocess=args.unisign_preprocess,
-                                unisign_hand_scale=args.unisign_hand_scale)
-    log(f"selection: {len(meta)} clips from {manifest}  "
-        f"{dict(collections.Counter(m['source'] for m in meta))}")
+    loaders = {}
+    def loader_for(stride, cap=None):
+        key = (stride, cap)
+        if key not in loaders:
+            loaders[key] = build_loader(
+                root, manifest, args.use_enriched, args.signspace, stride,
+                model.mt5_tokenizer, args.batch_size, real_wrists=args.real_wrists,
+                score_quantiles=args.score_quantiles,
+                unisign_preprocess=args.unisign_preprocess,
+                unisign_hand_scale=args.unisign_hand_scale,
+                target_fps=args.target_fps, cap_frames=cap)
+            log(f"selection: {len(loaders[key][1])} clips from {manifest} at "
+                f"stride {stride}, cap {cap}  "
+                f"{dict(collections.Counter(m['source'] for m in loaders[key][1]))}")
+        return loaders[key]
+    stride_of = {}
 
     default_decode = {'num_beams': 4, 'repetition_penalty': 1.3,
                       'no_repeat_ngram_size': 3}
-    summary = {'root': root, 'manifest': manifest, 'n_selection': len(meta),
+    summary = {'root': root, 'manifest': manifest,
+               'n_selection': len(json.load(open(manifest))),
                'checkpoints': {}, 'sweep': []}
     contaminated = {}
 
@@ -361,9 +398,17 @@ def main():
         log(f"=== {label}: {path}")
         info = load_weights(model, path, device)
         check_run_args(info, args, path)
+        stride = (info.get('run_args') or {}).get('downsample_every', LEGACY_STRIDE)
+        if args.downsample_every is not None and args.downsample_every != stride:
+            sys.exit(f"[fatal] {path} trained at stride {stride} but "
+                     f"--downsample-every {args.downsample_every} was given")
+        cap = (info.get('run_args') or {}).get('cap_frames')   # None before E11
+        stride_of[label] = (stride, cap)
+        log(f"  stride {stride} (from {'run_args' if (info.get('run_args') or {}).get('downsample_every') else 'legacy default'})")
+        loader, meta = loader_for(stride, cap)
         seen = train_videos(roots)
         res, rows = evaluate(label, model, loader, meta, device, default_decode,
-                             seen, args.out)
+                             seen, args.out, shuffle_pose=args.shuffle_pose)
         res['checkpoint'] = {'path': path, 'train_roots': roots, **info}
         summary['checkpoints'][label] = res
         contaminated[label] = {r['clip_id'] for r in rows if r['contaminated']}
@@ -399,6 +444,7 @@ def main():
         log(f"=== sweep target (auto, best common-clean chrF): {target}")
     if target:
         path, _, roots = next(sp for sp in specs if sp[1] == target)
+        loader, meta = loader_for(*stride_of[target])
         load_weights(model, path, device)
         seen = train_videos(roots)
         log(f"=== decoding sweep on {target} (dev selection only, never test)")

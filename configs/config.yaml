@@ -39,7 +39,13 @@ paths:
     lang: "kz"
     skip_low_quality: true
     min_hand_cov: 0.0     # e.g. 0.5 to drop clips with poor hand detection
-    downsample_every: 2   # videos are 50 fps → 25 fps for the encoder
+    # Stride 2 gives khabar 12.5 fps and qazaqstantv 15 fps (only informburo is
+    # 50 fps) -- the original comment's premise was wrong. But native rate
+    # (stride 1) was tested in E10 and is WORSE: 0/3 takeoff, coupling ~0.3 vs
+    # 1.2, chrF 11-18 vs 20-21. So 2 stays the default, now on evidence rather
+    # than by accident. Each checkpoint records its stride in run_args and the
+    # rescorer reads it from there, so this default never affects scoring.
+    downsample_every: 2
     # Output root of scripts/extract_asan_prosody.py (per-clip wavs,
     # prosody .npy, and manifest_{split}.jsonl for phases 2-3)
     prosody_root: "/home/<user>/krsl2speech/data/asan_prosody_v3"

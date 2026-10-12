@@ -37,6 +37,8 @@ from data.utils import (
     unisign_part_features,
     UNISIGN_DIM,
     enrich_keypoints,
+    resample_pose,
+    SOURCE_FPS,
     preprocess_keypoints,
     resample_prosody,
     resample_hand_crops,
@@ -74,6 +76,8 @@ class AsanDataset(Dataset):
         score_quantiles=None,    # E2: path to train-fitted score table
         unisign_preprocess=False,  # E3 arm B: exact upstream Uni-Sign inputs
         unisign_hand_scale=None,   # E3 arm D: path to fit_hand_ratio.py output
+        target_fps=None,         # resample every clip to this rate (see below)
+        cap_frames=None,         # Uni-Sign-style cap on frames per clip (see below)
         min_frames=25,           # skip clips shorter than this (pre-downsample)
         max_frames=1000,         # truncate after downsampling
         downsample_every=1,
@@ -94,10 +98,30 @@ class AsanDataset(Dataset):
         self.root = root
         self.tokenizer = tokenizer
         self.max_frames = max_frames
+        self.split = split
+        # Uni-Sign pretrained its encoder on at most 256 frames per clip, keeping
+        # a RANDOM SORTED SUBSET of longer clips (upstream datasets.py). Training
+        # here does the same; evaluation takes EVENLY SPACED frames instead, so
+        # scores are reproducible (upstream also randomises at eval; we do not).
+        self.cap_frames = cap_frames
         self.downsample_every = downsample_every
         self.signspace = signspace
         self.real_wrists = real_wrists
         self.unisign_preprocess = unisign_preprocess
+        # Sources were captured at 50 / 25 / 30 fps (ffprobe-measured) and nothing
+        # normalised them, so the same sign spanned twice as many frames in
+        # informburo as in khabar while the ST-GCN's temporal kernels are a fixed
+        # number of frames wide. target_fps resamples every clip to one rate.
+        # 25 is the natural target: it is the minimum, so nothing is upsampled
+        # and no frames are invented.
+        self.target_fps = target_fps
+        if target_fps is not None:
+            unknown = [s_ for s_ in sources if s_ not in SOURCE_FPS]
+            if unknown:
+                raise ValueError(
+                    f"target_fps set but source frame rate unknown for {unknown}; "
+                    f"measure it and add it to data.utils.SOURCE_FPS rather than "
+                    f"guessing -- a wrong rate silently rescales time.")
         self._hand_ratio = None
         if unisign_hand_scale:
             if not unisign_preprocess:
@@ -242,6 +266,11 @@ class AsanDataset(Dataset):
         except Exception as e:
             print(f"[warn] Failed to load {entry.get('pose')}: {e}")
             return self._blank_sample()
+        if self.target_fps is not None:
+            # Before every other transform, so min_frames/max_frames and the
+            # downsample stride all act on a common time base.
+            wb, sc = resample_pose(wb, sc, SOURCE_FPS[entry['_source']],
+                                   self.target_fps)
 
         if len(wb) == 0:
             return self._blank_sample()
@@ -262,6 +291,13 @@ class AsanDataset(Dataset):
             hand_l = hand_l[::self.downsample_every]
             hand_r = hand_r[::self.downsample_every]
             sc = sc[::self.downsample_every]
+        if self.cap_frames is not None and len(wb) > self.cap_frames:
+            if self.split == 'train':
+                # torch RNG: seeded per DataLoader worker, so runs stay seedable.
+                keep = np.sort(torch.randperm(len(wb))[:self.cap_frames].numpy())
+            else:
+                keep = np.linspace(0, len(wb) - 1, self.cap_frames).round().astype(np.int64)
+            wb, hand_l, hand_r, sc = wb[keep], hand_l[keep], hand_r[keep], sc[keep]
         if len(wb) > self.max_frames:
             wb = wb[:self.max_frames]
             hand_l = hand_l[:self.max_frames]

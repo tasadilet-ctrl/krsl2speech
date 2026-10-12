@@ -28,6 +28,23 @@ sequence-to-sequence objective.
 
 ## Where this stands
 
+> **Every number below was trained with a frame-rate bug (found 2026-10-04,
+> fixed 2026-10-08).** `downsample_every: 2` was applied to all sources on the
+> assumption that "videos are 50 fps", but khabar is 25 fps and qazaqstantv 30,
+> so **91% of the corpus trained at 12.5–15 fps in all 34 runs to date** while
+> informburo trained at 25. The arm *comparisons* mostly survive — every arm
+> shared the bug — but the absolute figures, and anything per-source, do not.
+> The config default is now 1. See
+> [AUDIT_IMPLEMENTATION_2026-10-08.md](AUDIT_IMPLEMENTATION_2026-10-08.md) and
+> [EXPERIMENT_e10_native_fps.md](EXPERIMENT_e10_native_fps.md) for the fix and
+> the retraining.
+>
+> Separately, the task has been reframed: scored as **retrieval** rather than
+> generation, the same checkpoints reach **86% top-1 out of 200** candidates
+> against 0.5% chance, with controls ruling out duration and memorisation
+> ([NOTES_retrieval.md](NOTES_retrieval.md)). The model couples to the video far
+> more than the generation metrics below suggest.
+
 **First valid numbers (E1, 2026-09-17).** Everything reported before this date
 was measured on 200 informburo clips with a mixed metric path and should be
 ignored — the trainer generated on the first 25 unshuffled batches, and

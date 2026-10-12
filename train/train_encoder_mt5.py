@@ -78,111 +78,9 @@ MT5_PATH = "google/mt5-base"  # 388M params, d_model=768 (matches Uni-Sign encod
 # Dataset (no tokenizer needed — MT5 has its own)
 # ============================================================
 
-class SimpleCollator:
-    """Collator for MT5 training. Tokenizes text here (not in forward!) for speed."""
-
-    def __init__(self, mt5_tokenizer=None, max_text_tokens=128):
-        self.mt5_tokenizer = mt5_tokenizer
-        self.max_text_tokens = max_text_tokens
-
-    def __call__(self, batch):
-        valid = [b for b in batch if b is not None and b.get('input_length', 0) > 0]
-        if not valid:
-            return None
-
-        # Filter samples with text
-        valid = [b for b in valid if b.get('text') and b['text'].strip()]
-        if not valid:
-            return None
-
-        # Sort by keypoint length (descending) for efficient padding
-        valid.sort(key=lambda x: x['input_length'], reverse=True)
-
-        # Pad keypoints
-        kps = [b['keypoints'] for b in valid]
-        max_t = max(k.shape[0] for k in kps)
-        input_lengths = torch.tensor([k.shape[0] for k in kps], dtype=torch.long)
-
-        kps_padded = torch.zeros(len(valid), max_t, kps[0].shape[1], dtype=torch.float32)
-        for i, k in enumerate(kps):
-            kps_padded[i, :k.shape[0], :] = k
-
-        # Pad RGB features (only if every sample in the batch has them --
-        # AsanDataset.__getitem__ already skips clips missing an rgb file
-        # entirely when load_rgb=True, via _blank_sample(), so partial
-        # coverage within a kept batch shouldn't normally happen once
-        # extraction covers all clips).
-        rgb_list = [b.get('rgb') for b in valid]
-        rgb_padded = None
-        if all(r is not None for r in rgb_list) and rgb_list:
-            rgb_padded = torch.zeros(len(valid), max_t, rgb_list[0].shape[1], dtype=torch.float32)
-            for i, r in enumerate(rgb_list):
-                rgb_padded[i, :r.shape[0], :] = r
-
-        # Prosody ([F0, energy], (T,2)) for the prosody-as-supervision
-        # ablation. Same all-or-nothing convention as rgb above:
-        # AsanDataset returns a blank sample for clips missing prosody, so a
-        # partial batch shouldn't occur once extraction covers the corpus.
-        prosody_list = [b.get('prosody') for b in valid]
-        prosody_padded = None
-        if all(p is not None for p in prosody_list) and prosody_list:
-            prosody_padded = torch.zeros(len(valid), max_t,
-                                         prosody_list[0].shape[1],
-                                         dtype=torch.float32)
-            for i, p_ in enumerate(prosody_list):
-                prosody_padded[i, :p_.shape[0], :] = p_
-
-        # Pad hand-crop fields for Prior-Guided Fusion (only if every
-        # sample in the batch has them -- same "skip clips missing the
-        # file entirely via _blank_sample()" convention as rgb above, so
-        # partial coverage within a kept batch shouldn't normally happen
-        # once extraction covers all clips).
-        hand_crops_list = [b.get('hand_crops') for b in valid]
-        hand_crops_padded = hand_ref_padded = hand_valid_padded = hand_score_padded = None
-        if all(h is not None for h in hand_crops_list) and hand_crops_list:
-            def _pad_time(tensors, extra_shape, dtype):
-                out = torch.zeros((len(valid), max_t) + extra_shape, dtype=dtype)
-                for i, t in enumerate(tensors):
-                    out[i, :t.shape[0]] = t
-                return out
-
-            hand_crops_padded = _pad_time(hand_crops_list, (2, 112, 112, 3), torch.uint8)
-            hand_ref_padded = _pad_time([b['hand_ref'] for b in valid], (2, 2), torch.float32)
-            hand_valid_padded = _pad_time([b['hand_valid'] for b in valid], (2,), torch.bool)
-            hand_score_padded = _pad_time([b['hand_score'] for b in valid], (2,), torch.float32)
-
-        # Tokenize text ONCE here (not every forward pass)
-        texts = [b['text'].strip() for b in valid]
-        if self.mt5_tokenizer is not None:
-            label_tokens = self.mt5_tokenizer(
-                texts, padding="longest", truncation=True,
-                max_length=self.max_text_tokens, return_tensors="pt",
-            )
-            label_ids = label_tokens['input_ids']
-            label_ids[label_ids == self.mt5_tokenizer.pad_token_id] = -100
-            label_attn = label_tokens['attention_mask']
-        else:
-            label_ids = None
-            label_attn = None
-
-        return {
-            'keypoints': kps_padded,
-            'input_lengths': input_lengths,
-            'label_ids': label_ids,            # (B, L_text) — -100 for pads
-            'label_attn_mask': label_attn,     # (B, L_text)
-            'rgb': rgb_padded,                  # (B, T, rgb_dim) or None
-            'prosody': prosody_padded,          # (B, T, 2) or None
-            'hand_crops': hand_crops_padded,    # (B, T, 2, 112, 112, 3) uint8 or None
-            'hand_ref': hand_ref_padded,        # (B, T, 2, 2) or None
-            'hand_valid': hand_valid_padded,    # (B, T, 2) bool or None
-            'hand_score': hand_score_padded,    # (B, T, 2) or None
-            'texts': texts,                     # raw strings for generation eval
-            # In the SAME (length-sorted) order as every tensor above. Any
-            # consumer attaching per-clip metadata must key on these, never on
-            # dataset order: this collator sorts by length and drops invalid
-            # samples, so batch position != dataset position.
-            'clip_ids': [b.get('clip_id', '') for b in valid],
-        }
+# Moved verbatim to train/collate.py; re-exported here because
+# scripts/rescore_checkpoints.py and others import it from this module.
+from train.collate import SimpleCollator  # noqa: E402,F401
 
 
 # ============================================================
@@ -248,6 +146,11 @@ def build_pose_mask(kps, input_lengths, ratio):
     return mask
 
 
+# Batch-log interval. 500 unless KRSL_LOG_EVERY is set -- the parity test
+# against train_min.py sets it to 1 to compare losses batch by batch.
+_LOG_EVERY = int(os.environ.get('KRSL_LOG_EVERY', '500'))
+
+
 def is_main():
     return not dist.is_initialized() or dist.get_rank() == 0
 
@@ -304,7 +207,8 @@ class UniSignMT5(nn.Module):
 
     def __init__(self, encoder, mt5_path=MT5_PATH, lang="Kazakh", align_dim=None,
                  masked_pose_dim=None, ctc_vocab_size=None,
-                 use_pgf=False, pgf_p_samp=0.5, prosody_aux_dim=None):
+                 use_pgf=False, pgf_p_samp=0.5, prosody_aux_dim=None,
+                 decoder_corrupt=0.0):
         """
         Args:
             encoder: KeypointEncoder
@@ -339,6 +243,9 @@ class UniSignMT5(nn.Module):
         super().__init__()
         self.encoder = encoder
         self.lang = lang
+        # E8: fraction of decoder INPUT tokens replaced with random ones
+        # during training. Inference and labels are untouched.
+        self.decoder_corrupt = decoder_corrupt
 
         self.ctc_head = None
         if ctc_vocab_size is not None:
@@ -665,13 +572,37 @@ class UniSignMT5(nn.Module):
         # Attention mask: prefix + pose (encoder inputs only)
         attention_mask = torch.cat([prefix_attn, pose_mask], dim=1)
 
-        # MT5 forward
-        out = self.mt5(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            labels=label_ids,
-            return_dict=True,
-        )
+        # MT5 forward.
+        # E8: decoder input corruption. Under teacher forcing the decoder can
+        # predict token t from the gold prefix alone, so a low-CE solution that
+        # ignores cross-attention exists and is reachable from step one. Replacing
+        # a fraction of decoder INPUT tokens with random ones removes that
+        # solution: where the prefix is destroyed, cross-attention over the pose
+        # is the only remaining information about token t. Labels are untouched,
+        # so the target is still the correct text.
+        if self.decoder_corrupt > 0.0 and self.training:
+            dec_in = self.mt5._shift_right(label_ids)   # also maps -100 -> pad id
+            # T5's decoder_start_token_id IS pad_token_id, so this mask excludes
+            # position 0 (the start token) and every pad position in one go --
+            # corrupting either would change sequence structure, not the prefix.
+            real = dec_in != self.mt5.config.pad_token_id
+            sel = real & (torch.rand(dec_in.shape, device=dec_in.device)
+                          < self.decoder_corrupt)
+            rnd = torch.randint_like(dec_in, 0, self.mt5.config.vocab_size)
+            out = self.mt5(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                decoder_input_ids=torch.where(sel, rnd, dec_in),
+                labels=label_ids,
+                return_dict=True,
+            )
+        else:
+            out = self.mt5(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                labels=label_ids,
+                return_dict=True,
+            )
 
         # Masked-pose reconstruction aux loss. The decoder always runs when
         # a frame_mask is supplied so that DDP (find_unused_parameters=False)
@@ -717,7 +648,8 @@ class UniSignMT5(nn.Module):
 
     def generate(self, kps, input_lengths=None, max_new_tokens=128, num_beams=4,
                 hand_crops=None, hand_ref=None, hand_valid=None, hand_score=None,
-                no_repeat_ngram_size=3, repetition_penalty=1.3):
+                no_repeat_ngram_size=3, repetition_penalty=1.3,
+                shuffle_pose=False):
         """
         Inference: generate text from keypoints.
 
@@ -728,6 +660,11 @@ class UniSignMT5(nn.Module):
             num_beams: beam width
             hand_crops, hand_ref, hand_valid, hand_score: Prior-Guided
                 Fusion inputs, or None (see forward()/_make_pgf_hook above)
+            shuffle_pose: E8 step 1 diagnostic. Decode every clip against a
+                DIFFERENT clip's pose, to measure how much the decoder actually
+                uses its encoder: delta = chrF(clean) - chrF(shuffled). A
+                decoder ignoring the encoder scores the same either way.
+                Inference-only; never set during training.
 
         Returns:
             list of decoded strings
@@ -742,6 +679,17 @@ class UniSignMT5(nn.Module):
         prefix_attn = self.prefix_attn.unsqueeze(0).expand(B, -1)
 
         pose_mask = self._pose_mask(kps, input_lengths)
+        if shuffle_pose and B > 1:
+            # Permute the ENCODER OUTPUT, and permute the pose mask with it.
+            # Shuffling the embedding alone would decode clip i's pose under
+            # clip j's length mask, truncating or padding it -- that confounds
+            # "wrong pose" with a padding artefact.
+            # roll(1) is a derangement (no clip keeps its own pose) and is
+            # deterministic, needing no seed. The collator sorts each batch by
+            # length, so a roll of 1 pairs each clip with its nearest-length
+            # neighbour, which also minimises any residual length effect.
+            pose_emb = pose_emb.roll(1, dims=0)
+            pose_mask = pose_mask.roll(1, dims=0)
         attention_mask = torch.cat([prefix_attn, pose_mask], dim=1)
         inputs_embeds = torch.cat([prefix_embeds, pose_emb], dim=1)
 
@@ -776,11 +724,13 @@ class MT5Trainer:
                  selection_manifest=None, block_padding_mask=False,
                  real_wrists=False, score_quantiles=None,
                  unisign_preprocess=False, unisign_hand_scale=None,
+                 target_fps=None, decoder_corrupt=0.0, downsample_every=None,
+                 init_from=None, init_allow_input_change=False,
                  align_cache=None, align_weight=0.0, align_negatives=256,
                  align_dim=256, align_mode='seq',
                  masked_pose_ratio=0.0, overfit_n=0,
                  ctc_weight=0.0, ctc_vocab_size=2000, resume=None,
-                 grad_accum=None, encoder_lr=None, mt5_lr=None,
+                 grad_accum=None, encoder_lr=None, mt5_lr=None, mt5_path=MT5_PATH,
                  use_pgf=False, hand_crop_root=None, pgf_p_samp=0.5,
                  pretrained_pgf=None, prosody_aux_weight=0.0, prosody_root=None,
                  select_metric='wer'):
@@ -861,13 +811,18 @@ class MT5Trainer:
         # checkpoint so --resume can verify the resuming run uses the same
         # architecture (a mismatch here breaks state_dict loads far less
         # clearly than this explicit check does).
+        self.target_fps = target_fps
+        # None = take paths.asan.downsample_every from the config. The value
+        # actually used is written into run_args when the dataset is built.
+        self.downsample_every = downsample_every
         self._run_args = dict(
             use_enriched=use_enriched, signspace=signspace,
             selection_manifest=selection_manifest,
             block_padding_mask=block_padding_mask,
             real_wrists=real_wrists,
             score_quantiles=score_quantiles,
-            unisign_preprocess=unisign_preprocess,
+            unisign_preprocess=unisign_preprocess, mt5_path=mt5_path,
+            target_fps=target_fps, decoder_corrupt=decoder_corrupt,
             unisign_hand_scale=unisign_hand_scale,
             align_weight=align_weight, align_negatives=align_negatives,
             align_dim=align_dim if align_weight > 0 else None,
@@ -928,12 +883,16 @@ class MT5Trainer:
         # backprops into the encoder.
         self.model = UniSignMT5(
             align_dim=align_dim if align_weight > 0 else None,
+            mt5_path=mt5_path,
             encoder=self.encoder, lang="Kazakh",
             masked_pose_dim=input_dim if masked_pose_ratio > 0 else None,
             ctc_vocab_size=self.ctc_vocab_size if self.ctc_tokenizer else None,
             use_pgf=use_pgf, pgf_p_samp=pgf_p_samp,
             prosody_aux_dim=2 if prosody_aux_weight > 0 else None,
+            decoder_corrupt=decoder_corrupt,
         )
+        if init_from:
+            self._init_from_checkpoint(init_from, init_allow_input_change)
         if masked_pose_ratio > 0:
             log(f"[Masked Pose] Reconstruction decoder: {self.cfg['d_model']} → {input_dim}")
             log(f"[Masked Pose] Mask ratio: {masked_pose_ratio}")
@@ -1150,6 +1109,47 @@ class MT5Trainer:
         log(f"\n[MT5 Trainer] Encoder: {self.encoder_total_params:,} | MT5: {self.mt5_params:,}")
         log(f"[MT5 Trainer] Device: {self.device}")
 
+    def _init_from_checkpoint(self, path, allow_input_change):
+        """Weights-only start from a full trained model. Refuses to cross input
+        pipelines unless explicitly allowed: a model trained on one stride or
+        preprocessing fed another is a different experiment, and should look
+        like one in the command line."""
+        ck = torch.load(path, map_location='cpu', weights_only=False)
+        src = dict(ck.get('run_args') or {})
+        src.setdefault('downsample_every', 2)          # 34/34 pre-key runs
+        cur = dict(self._run_args)
+        cur['downsample_every'] = int(
+            self.downsample_every if self.downsample_every is not None
+            else self.config['paths'].get('asan', {}).get('downsample_every', 1))
+        keys = ('unisign_preprocess', 'block_padding_mask', 'real_wrists', 'signspace',
+                'use_enriched', 'target_fps', 'downsample_every')
+        diff = {k: (src.get(k), cur.get(k)) for k in keys
+                if k in src and src.get(k) != cur.get(k)}
+        if diff and not allow_input_change:
+            raise ValueError(
+                f"[Init] {path} was trained on a different input pipeline "
+                f"(source, this run): {diff}. Pass --init-allow-input-change to "
+                f"do this deliberately.")
+        core = self.model
+        core.encoder.load_state_dict(ck['encoder'])
+        if 'pose_norm' in ck:
+            core.pose_norm.load_state_dict(ck['pose_norm'])
+        if 'mt5' not in ck:
+            raise ValueError(f"[Init] {path} has no full mT5 weights")
+        core.mt5.load_state_dict(ck['mt5'])
+        self._run_args['init_from'] = os.path.abspath(path)
+        log(f"[Init] weights from {path} (epoch {ck.get('epoch')}); fresh optimizer "
+            f"and schedule" + (f"; INPUT CHANGE {diff}" if diff else ""))
+        del ck
+
+    def _effective_stride(self, asan_cfg):
+        """Temporal stride for the asan loader, recorded in run_args so the
+        rescorer can score this checkpoint at the stride it trained with."""
+        eff = (self.downsample_every if self.downsample_every is not None
+               else asan_cfg.get('downsample_every', 1))
+        self._run_args['downsample_every'] = int(eff)
+        return int(eff)
+
     def _load_resume_checkpoint(self, path):
         """
         Restore a full trainer state saved by _build_checkpoint: model
@@ -1162,7 +1162,15 @@ class MT5Trainer:
         log(f"[Resume] Loading trainer state from {path}")
         ckpt = torch.load(path, map_location='cpu')
 
-        saved_args = ckpt.get('run_args', {})
+        saved_args = dict(ckpt.get('run_args', {}))
+        # Stride is only known once create_datasets runs, which is after this.
+        # Resolve it now so a resume cannot silently change it: checkpoints that
+        # predate the key all trained at stride 2 (34/34 logs), and the config
+        # default became 1 on 2026-10-08.
+        self._run_args['downsample_every'] = int(
+            self.downsample_every if self.downsample_every is not None
+            else self.config['paths'].get('asan', {}).get('downsample_every', 1))
+        saved_args.setdefault('downsample_every', 2)
         mismatches = {
             k: (self._run_args[k], saved_args[k]) for k in saved_args
             if k in self._run_args and self._run_args[k] != saved_args[k]
@@ -1349,13 +1357,14 @@ class MT5Trainer:
                 lang=asan_cfg.get('lang', 'kz'),
                 tokenizer=None,
                 max_frames=self.train_cfg['max_seq_len'],
-                downsample_every=asan_cfg.get('downsample_every', 1),
+                downsample_every=self._effective_stride(asan_cfg),
                 use_enriched=self.use_enriched,
                 signspace=self.signspace,
                 real_wrists=self.real_wrists,
                 score_quantiles=self.score_quantiles,
                 unisign_preprocess=self.unisign_preprocess,
                 unisign_hand_scale=self.unisign_hand_scale,
+                target_fps=self.target_fps,
                 skip_low_quality=asan_cfg.get('skip_low_quality', True),
                 min_hand_cov=asan_cfg.get('min_hand_cov', 0.0),
                 # Hand crops are only extracted for asan-dataset (khabar_kz/
@@ -1714,7 +1723,7 @@ class MT5Trainer:
                 self.global_step += 1
                 self.scheduler.step()
 
-            if is_main() and batch_idx % 500 == 0 and batch_idx > 0:
+            if is_main() and batch_idx % _LOG_EVERY == 0 and batch_idx > 0:
                 log(f"  Batch {batch_idx}/{len(train_loader)} | "
                      f"Loss: {total_loss / num_batches:.4f}"
                      + (f" | MSE: {total_mse / num_batches:.4f}" if total_mse > 0 else "")
@@ -2064,6 +2073,40 @@ def main():
                              'so a clip embedding depends on batch padding. '
                              'Makes eval exactly padding-invariant; training '
                              'BatchNorm statistics still count padded frames.')
+    parser.add_argument('--init-from', default=None,
+                        help='Start from a FULL trained model (encoder + pose_norm '
+                             '+ mT5), weights only: fresh optimizer, schedule and '
+                             'epoch counter. Use it to begin from a run that already '
+                             'takes off instead of re-rolling the ~1/3 lottery for '
+                             'every experiment. Not --resume, which continues a run.')
+    parser.add_argument('--init-allow-input-change', action='store_true',
+                        help='Permit --init-from across a different input pipeline '
+                             '(stride, target_fps, preprocessing). Refused by default.')
+    parser.add_argument('--downsample-every', type=int, default=None,
+                        help='Temporal stride on the asan loader. Overrides '
+                             'paths.asan.downsample_every. Every run before '
+                             '2026-10-08 used 2, under a config comment that '
+                             'assumed all videos were 50 fps -- true only for '
+                             'informburo, so khabar trained at 12.5 fps and '
+                             'qazaqstantv at 15. Recorded in run_args; the '
+                             'rescorer scores each checkpoint at its own stride.')
+    parser.add_argument('--decoder-corrupt', type=float, default=0.0,
+                        help='E8: replace this fraction of decoder INPUT tokens '
+                             'with random ones during TRAINING only (labels and '
+                             'inference unchanged), so the gold prefix alone no '
+                             'longer suffices and cross-attention is the only '
+                             'source left. Validation runs clean, so val CE stays '
+                             'comparable; TRAIN CE does not and must not be '
+                             'compared across arms.')
+    parser.add_argument('--target-fps', type=int, default=None,
+                        help='Resample every clip to this frame rate. Sources '
+                             'are 50/25/30 fps (ffprobe-measured) and were never '
+                             'normalised, so the same sign spanned 2x as many '
+                             'frames in informburo as in khabar while the ST-GCN '
+                             'temporal kernels are a fixed frame width. Use 25: '
+                             'it is the minimum, so nothing is upsampled. Changes '
+                             'encoder input -- do NOT --resume a checkpoint '
+                             'trained at a different setting.')
     parser.add_argument('--unisign-preprocess', action='store_true',
                         help='E3 arm B: exact port of upstream Uni-Sign pose '
                              'preprocessing (9-joint body with real wrists, '
@@ -2132,6 +2175,10 @@ def main():
                              "len(train_loader) is tiny, so the config's "
                              "grad_accum=4 can collapse to ~1 optimizer step "
                              "per epoch. Pass --grad-accum 1 for sanity checks.")
+    parser.add_argument('--mt5-path', default=MT5_PATH,
+                        help='E7: mT5 to initialise from. Default is base '
+                             'google/mt5-base; point it at the text-adapted '
+                             'model from scripts/adapt_mt5_text.py.')
     parser.add_argument('--mt5-lr', type=float, default=None,
                         help='E4: LR for the mT5 decoder group (default: the '
                              'config learning_rate, 5e-4). The encoder defaults '
@@ -2213,6 +2260,12 @@ def main():
                              'and always stays at its fresh init.')
     args = parser.parse_args()
 
+    if os.environ.get('KRSL_DETERMINISTIC') == '1':
+        # Parity testing against train_min.py --deterministic. Off by default.
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
     import random as _random
     _random.seed(args.seed)
     import numpy as _np
@@ -2236,6 +2289,9 @@ def main():
     if args.use_pgf and not args.hand_crop_root:
         parser.error("--use-pgf requires --hand-crop-root")
 
+    if args.init_from and (args.resume or args.pretrained_encoder):
+        parser.error('--init-from loads the full model; it cannot be '
+                     'combined with --resume or --pretrained-encoder')
     if args.resume and (args.pretrained_encoder or args.pretrained_unisign):
         print("[WARN] --resume overrides --pretrained-encoder/--pretrained-unisign "
               "(their weights would be loaded then immediately replaced).")
@@ -2271,6 +2327,11 @@ def main():
         real_wrists=args.real_wrists,
         score_quantiles=args.score_quantiles,
         unisign_preprocess=args.unisign_preprocess,
+        target_fps=args.target_fps,
+        decoder_corrupt=args.decoder_corrupt,
+        downsample_every=args.downsample_every,
+        init_from=args.init_from,
+        init_allow_input_change=args.init_allow_input_change,
         unisign_hand_scale=args.unisign_hand_scale,
         align_dim=args.align_dim,
         align_negatives=args.align_negatives,
@@ -2285,6 +2346,7 @@ def main():
         grad_accum=args.grad_accum,
         encoder_lr=args.encoder_lr,
         mt5_lr=args.mt5_lr,
+        mt5_path=args.mt5_path,
         use_pgf=args.use_pgf,
         hand_crop_root=args.hand_crop_root,
         pgf_p_samp=args.pgf_p_samp,
