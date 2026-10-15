@@ -92,3 +92,51 @@ smallest hands (31 px). Which of these matters is not separated here.
 
 Also verified: `scripts/sign_retrieve.py` (the user-facing tool) ranked the
 correct line first for all 3 clips of a 6-sentence khabar bulletin, run on CPU.
+
+## Results -- test split, run once with B_s0 (2026-10-13)
+
+`run_e12_test.sh`, outputs `output/e12_test_t1/`, `output/e12_test_t2/`.
+
+### T2 -- within-broadcast alignment
+
+| source | queries | mean pool | top-1 | MRR | chance top-1 | dev top-1 |
+|---|---|---|---|---|---|---|
+| informburo | 370 | 6.4 | 0.900 | 0.939 | 0.162 | 0.925 |
+| khabar | 343 | 5.9 | 0.965 | 0.979 | 0.175 | 0.967 |
+| qazaqstantv | 407 | 7.6 | 0.639 | 0.749 | 0.147 | 0.670 |
+| **all** | 1120 | 6.7 | **0.825** | **0.882** | 0.161 | 0.851 |
+
+**Reading: "T2 MRR >= 0.70 and top-1 >= 3x chance" -- met** (MRR 0.882,
+top-1 5.1x chance). Within-broadcast alignment works well enough to use for
+data cleaning and as a demo. Test is 0.026 below dev, as expected after
+selecting on dev.
+
+**The dev error structure did not replicate.** Dev: 52% of wrong picks were the
+adjacent sentence vs 33% for random errors. Test: 35% vs 29.5%, with 46% of
+errors three or more sentences away. Test pools are larger (qazaqstantv mean
+7.6, up to 16), which gives distant errors more room. "Errors are mostly
+within-story confusions" is therefore only weakly supported; do not claim it.
+
+### T1 -- cross-broadcast search (200-way, same source)
+
+| source | top-1 | top-5 | MRR | raw top-1 | dev top-1 |
+|---|---|---|---|---|---|
+| informburo | 0.835 | 0.930 | 0.882 | 0.010 | 0.855 |
+| khabar | 0.885 | 0.945 | 0.910 | 0.015 | 0.865 |
+| qazaqstantv | 0.700 | 0.780 | 0.745 | 0.005 | not measured |
+| **all** | **0.807** | **0.885** | **0.845** | | |
+
+Median rank 1; chance top-1 0.005.
+
+**Reading: "T1 top-1 within 0.05 of dev" -- met.** The dev figure (~0.85) only
+ever covered informburo and khabar (the dev run was stopped before
+qazaqstantv). On those two sources test averages 0.860, the same as dev
+(0.855 / 0.865). The all-source 0.807 includes qazaqstantv, which has no dev
+counterpart; even compared naively it is within 0.05.
+
+### Summary
+
+Both tasks hold on held-out data. Retrieval is a deliverable for informburo and
+khabar (top-1 0.84-0.97 across both tasks); qazaqstantv works but is
+consistently ~0.2-0.3 weaker on both, cause unseparated (transcript style and
+fragment references, 31 px hands).

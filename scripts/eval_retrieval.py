@@ -180,7 +180,7 @@ def main():
     ap.add_argument('--block-padding-mask', action='store_true')
     ap.add_argument('--target-fps', type=int, default=None)
     ap.add_argument('--null-k', type=int, default=3)
-    ap.add_argument('--split', default='val', choices=['val', 'test'])
+    ap.add_argument('--split', default='val', choices=['val', 'test', 'train'])
     ap.add_argument('--pool', default='source', choices=['source', 'video'],
                     help='source: rank against every same-source clip in the manifest '
                          '(T1). video: rank only against sentences of the SAME broadcast '

@@ -32,3 +32,47 @@ clips); resolutions by ffprobe on the processed and raw videos.
 The model can still use coarse cues -- arm trajectory, location, movement,
 two-handedness, non-manual signals -- which is consistent with partial
 information: retrieval works (NOTES_retrieval.md) while generation does not.
+
+## Keypoint quality, checked by eye (2026-10-14)
+
+`scripts/render_keypoint_overlays.py` + `scripts/build_qazaq_viewer.py` render
+qazaqstantv clips with keypoints drawn on (served from `~/qazaq_viewer`).
+
+- **The whole-body hands we train on (RTMW, wb_xy[91:133]) beat the dedicated
+  sign-language hand model** (`tasmulaev/rtmpose-m-distill`, hand_l_xy /
+  hand_r_xy, present in every qazaqstantv .npz). Judged by the project owner
+  over 80 dev clips: the dedicated model "messes up the finger keypoints very
+  badly". The two sets differ by a median 6.8 px on ~31 px hands. Swapping
+  them in is ruled out.
+- **Knees and ankles are hallucinated.** The legs are below the interpreter
+  crop; RTMW guesses them anew each frame (49-73 px jumps at p90, vs 5-10 px
+  for wrists and knuckles) and they land near the resting hands. The model
+  never receives them (Uni-Sign body = nose, ears, shoulders, elbows, wrists),
+  so this affects only visualisation; the overlay now draws exactly the 69
+  model inputs.
+- **Guessed hands, measured (2026-10-14, `scripts/measure_guessed_hands.py`,
+  200 dev clips per source).** The whole-body model reports both hands in every
+  frame and the Uni-Sign threshold (score <= 0.3) masks **0%** of hand-frames,
+  so the model cannot tell a seen hand from a guessed one. How often a hand is
+  actually not visible:
+
+  | source | hand outside the frame | RTMW score separates it (AUC) |
+  |---|---|---|
+  | informburo | 0.01% | 1.000 |
+  | khabar | 2.08% | 0.991 |
+  | qazaqstantv | 1.85% | 0.922 |
+
+  Checked on a contact sheet of flagged frames: out-of-frame hands are real --
+  hands resting below the crop, i.e. pauses -- with invented coordinates.
+  The dedicated detector's "no hand" frames (2.41% on qazaqstantv) are
+  mostly NOT invisibility: both hands are visible but overlapping or crossed,
+  and the whole-body points sit on them. Rare frames with no interpreter at
+  all (scene transitions) also occur, with hand points scattered on empty
+  background; `person_found` never flags them (0 of 81,832 frames).
+
+  **Reading: guessed hands are ~2% of hand-frames on khabar and qazaqstantv,
+  ~0% on informburo, concentrated in rest pauses.** The model's own score
+  knows (visible median ~5.0-5.6, out-of-frame 0.8-2.5), so a calibrated
+  threshold would catch them -- score < 2.0 masks 1.0% of hand-frames. Given
+  the small share and that pauses carry little signing, this is a cleanup, not
+  a likely lever on translation quality; not worth a seeded arm on its own.

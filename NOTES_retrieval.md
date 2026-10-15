@@ -1,5 +1,10 @@
 # Sign -> text retrieval already works (2026-10-08)
 
+**Held-out result (E12, 2026-10-13, test split, B_s0, run once):** cross-broadcast
+200-way top-1 0.807 (informburo 0.835, khabar 0.885, qazaqstantv 0.700); within-
+broadcast alignment top-1 0.825 vs 0.161 chance, MRR 0.882. Tool:
+`scripts/sign_retrieve.py`. Details: EXPERIMENT_e12_retrieval_task.md.
+
 `scripts/eval_retrieval.py`, outputs in `output/retrieval/`. No training: an
 existing translation checkpoint is used as a scorer.
 

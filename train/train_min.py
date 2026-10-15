@@ -29,6 +29,7 @@ Usage:
         --pretrained-unisign checkpoints/unisign/csl_stage1_weight.pth
 """
 import argparse
+import json
 import math
 import os
 import random
@@ -127,7 +128,12 @@ def load_model_weights(model, ck):
     model.mt5.load_state_dict(ck['mt5'])
 
 
-def build_loaders(cfg, pipe, collator, batch_size):
+def video_of(e):
+    """video_id field, else the middle of 'src__video__segNNN'."""
+    return e.get('video_id') or e['clip_id'].split('__')[1]
+
+
+def build_loaders(cfg, pipe, collator, batch_size, keep=None):
     a = cfg['paths']['asan']
     common = dict(root=a['root'], sources=a.get('sources', ['informburo', 'khabar', 'qazaqstantv']),
                   lang=a.get('lang', 'kz'), tokenizer=None,
@@ -137,6 +143,12 @@ def build_loaders(cfg, pipe, collator, batch_size):
                   skip_low_quality=a.get('skip_low_quality', True),
                   min_hand_cov=a.get('min_hand_cov', 0.0))
     train = AsanDataset(split='train', **common)
+    if keep is not None:
+        before = len(train.clips)
+        train.clips = [e for e in train.clips if f"{e['_source']}/{video_of(e)}" in keep]
+        log(f'[train-videos] kept {len(train.clips)} of {before} train clips')
+        if not train.clips:
+            sys.exit('[fatal] --train-videos matched no training clips')
     val = AsanDataset(split='val', **common)
     return (DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=4,
                        collate_fn=collator, pin_memory=True, persistent_workers=True),
@@ -180,6 +192,9 @@ def main():
     ap.add_argument('--resume', default=None, help='continue a train_min run')
     ap.add_argument('--downsample-every', type=int, default=None)
     ap.add_argument('--target-fps', type=int, default=None)
+    ap.add_argument('--train-videos', default=None,
+                    help='JSON list of "source/video_id": train only on these broadcasts '
+                         '(cross-fitting for the train-set audit). Dev is unaffected.')
     ap.add_argument('--cap-frames', type=int, default=None,
                     help='Uni-Sign-style cap: clips longer than this keep a random sorted '
                          'subset of frames in training, evenly spaced frames in eval. '
@@ -261,7 +276,10 @@ def main():
 
     collator = SimpleCollator(mt5_tokenizer=model.mt5_tokenizer,
                               max_text_tokens=p1.get('max_text_len', 128))
-    train_loader, val_loader = build_loaders(cfg, pipe, collator, p1['batch_size'])
+    keep = set(json.load(open(args.train_videos))) if args.train_videos else None
+    if args.train_videos:
+        run_args['train_videos'] = os.path.abspath(args.train_videos)
+    train_loader, val_loader = build_loaders(cfg, pipe, collator, p1['batch_size'], keep)
     accum = max(1, args.grad_accum or p1.get('grad_accum', 1))
     epochs = args.epochs or p1['max_epochs']
     total = math.ceil(len(train_loader) / accum) * epochs
