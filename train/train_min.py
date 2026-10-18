@@ -133,7 +133,7 @@ def video_of(e):
     return e.get('video_id') or e['clip_id'].split('__')[1]
 
 
-def build_loaders(cfg, pipe, collator, batch_size, keep=None):
+def build_loaders(cfg, pipe, collator, batch_size, keep=None, exclude=None):
     a = cfg['paths']['asan']
     common = dict(root=a['root'], sources=a.get('sources', ['informburo', 'khabar', 'qazaqstantv']),
                   lang=a.get('lang', 'kz'), tokenizer=None,
@@ -143,6 +143,11 @@ def build_loaders(cfg, pipe, collator, batch_size, keep=None):
                   skip_low_quality=a.get('skip_low_quality', True),
                   min_hand_cov=a.get('min_hand_cov', 0.0))
     train = AsanDataset(split='train', **common)
+    if exclude:
+        before = len(train.clips)
+        train.clips = [e for e in train.clips if e['clip_id'] not in exclude]
+        log(f'[exclude-clips] dropped {before - len(train.clips)} of {before} train clips '
+            f'({len(exclude)} listed)')
     if keep is not None:
         before = len(train.clips)
         train.clips = [e for e in train.clips if f"{e['_source']}/{video_of(e)}" in keep]
@@ -192,6 +197,9 @@ def main():
     ap.add_argument('--resume', default=None, help='continue a train_min run')
     ap.add_argument('--downsample-every', type=int, default=None)
     ap.add_argument('--target-fps', type=int, default=None)
+    ap.add_argument('--exclude-clips', default=None,
+                    help='JSON list of clip_ids to drop from TRAIN (e.g. the corpus audit\'s '
+                         'flagged references). Dev is unaffected.')
     ap.add_argument('--train-videos', default=None,
                     help='JSON list of "source/video_id": train only on these broadcasts '
                          '(cross-fitting for the train-set audit). Dev is unaffected.')
@@ -200,6 +208,12 @@ def main():
                          'subset of frames in training, evenly spaced frames in eval. '
                          'Uni-Sign pretrained with 256.')
     ap.add_argument('--mt5-path', default='google/mt5-base')
+    ap.add_argument('--base-lr', type=float, default=None,
+                    help='Overrides training.phase1.learning_rate: mT5 and pose_norm train at '
+                         'this rate, the encoder at a tenth of it (unless --mt5-lr / '
+                         '--encoder-lr say otherwise). Use a low value when fine-tuning '
+                         'from --init-from, so the first steps do not knock a coupled model '
+                         'out of its working state.')
     ap.add_argument('--encoder-lr', type=float, default=None)
     ap.add_argument('--mt5-lr', type=float, default=None)
     ap.add_argument('--grad-accum', type=int, default=None)
@@ -236,7 +250,7 @@ def main():
     if args.pretrained_unisign:
         load_unisign_weights(encoder, args.pretrained_unisign)
     model = SignMT5(encoder, args.mt5_path)
-    run_args = dict(pipe, mt5_path=args.mt5_path, selection_manifest=None,
+    run_args = dict(pipe, mt5_path=args.mt5_path, base_lr=args.base_lr, selection_manifest=None,
                     score_quantiles=None, unisign_hand_scale=None, trainer='train_min',
                     seed=args.seed, deterministic=args.deterministic)
     if args.init_from:
@@ -250,7 +264,7 @@ def main():
         del ck
     model.to(device)
 
-    base_lr = p1.get('learning_rate', 5e-4)
+    base_lr = args.base_lr if args.base_lr is not None else p1.get('learning_rate', 5e-4)
     groups = [{'params': list(model.encoder.parameters()),
                'lr': args.encoder_lr if args.encoder_lr is not None else base_lr / 10},
               {'params': list(model.mt5.parameters()),
@@ -279,7 +293,11 @@ def main():
     keep = set(json.load(open(args.train_videos))) if args.train_videos else None
     if args.train_videos:
         run_args['train_videos'] = os.path.abspath(args.train_videos)
-    train_loader, val_loader = build_loaders(cfg, pipe, collator, p1['batch_size'], keep)
+    exclude = set(json.load(open(args.exclude_clips))) if args.exclude_clips else None
+    if args.exclude_clips:
+        run_args['exclude_clips'] = os.path.abspath(args.exclude_clips)
+        run_args['n_excluded'] = len(exclude)
+    train_loader, val_loader = build_loaders(cfg, pipe, collator, p1['batch_size'], keep, exclude)
     accum = max(1, args.grad_accum or p1.get('grad_accum', 1))
     epochs = args.epochs or p1['max_epochs']
     total = math.ceil(len(train_loader) / accum) * epochs

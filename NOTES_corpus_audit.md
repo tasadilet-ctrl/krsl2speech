@@ -99,3 +99,48 @@ with human transcripts flagged 16.9% [14.0, 20.3] vs 3.9% [1.3, 10.8] for
 speech-recognition text.
 
 Full train audit launched: `run_train_audit.sh` -> `output/audit_train_report/`.
+
+## Full TRAIN audit (2026-10-16)
+
+`output/audit_train_report/` -- 58,437 training clips in broadcasts with >= 2
+clips, scored by B_s0. Training pools are larger (~8-9 sentences) than dev.
+
+| source | train clips | flagged | 95% CI | dev+test |
+|---|---|---|---|---|
+| informburo | 5,240 | 1.0% | [0.8, 1.3] | 1.5% |
+| khabar | 21,246 | 0.4% | [0.3, 0.4] | 0.4% |
+| **qazaqstantv** | 31,951 | **13.1%** (4,200 clips) | [12.8, 13.5] | 11.5% |
+
+Validation holds: speech-rate outliers flagged 41.5% vs 4.3% (x9.8).
+Adjacent-sentence share among flags 27% vs 22% by chance: a small excess, so
+boundary shifts may contribute a little; not the main pattern.
+
+### The human-transcript matching is the main source -- survives confound checks
+
+| qazaqstantv train | human text (n=28,427) | ASR fallback (n=3,524) | ratio |
+|---|---|---|---|
+| flagged, all | 14.2% | 5.0% | x2.8 |
+| flagged, normal speech rate only | 8.4% | 4.4% | x1.9 |
+| flagged, broadcasts of 2-6 sentences | 4.9% | 1.9% | x2.5 |
+| flagged, broadcasts of 7+ | 22.0% | 5.7% | x3.9 |
+| implausible speech rate | 13.5% | 2.6% | x5 |
+
+Speech-recognition clips come from LARGER broadcasts (median 11 vs 7
+sentences), which makes retrieval harder for them -- the confound runs against
+the finding, so it is conservative. `text_human` is the broadcast's article
+text matched onto time segments (methodology.md step 5); speech-recognition
+text is a verbatim record of the window. The matching step is where
+qazaqstantv's misalignment enters, and it is worst in long broadcasts.
+
+**For the data owner:** `output/audit_train_report/qazaqstantv_flagged_for_data_owner.csv`
+-- every flagged qazaqstantv clip in train, dev and test, worst first, with its
+text, the better-fitting sentence, margins, speech rate and text source.
+
+### Next experiment this enables (not run)
+
+Retrain B with the 4,200 flagged qazaqstantv training clips removed (13% of
+qazaqstantv, 7% of all train), three seeds, judged on coupling and on
+qazaqstantv test retrieval/chrF against B. This is the first experiment that
+would TEST "bad references are qazaqstantv's weakness" rather than observe it.
+Caveat for its design: the flags come from B_s0, so evaluation must use the
+full test set, not a flag-filtered one, to avoid favouring the flagging model.
