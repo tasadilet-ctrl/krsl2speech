@@ -307,6 +307,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default='configs/config.yaml')
     ap.add_argument('--root', default='~/asan_canonical')
+    ap.add_argument('--split', default='val', choices=['val', 'test'],
+                    help='annotation split the manifest clips come from (test: once, for reporting)')
     ap.add_argument('--manifest', default=None,
                     help='defaults to <root>/selection_manifest.json')
     ap.add_argument('--ckpt', action='append', required=True,
@@ -380,7 +382,7 @@ def main():
                 score_quantiles=args.score_quantiles,
                 unisign_preprocess=args.unisign_preprocess,
                 unisign_hand_scale=args.unisign_hand_scale,
-                target_fps=args.target_fps, cap_frames=cap)
+                target_fps=args.target_fps, cap_frames=cap, split=args.split)
             log(f"selection: {len(loaders[key][1])} clips from {manifest} at "
                 f"stride {stride}, cap {cap}  "
                 f"{dict(collections.Counter(m['source'] for m in loaders[key][1]))}")
